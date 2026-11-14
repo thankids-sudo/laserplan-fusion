@@ -58,8 +58,11 @@ jobs:
           DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
         run: |
           if [ -n "${DEBUG_KEYSTORE_B64}" ]; then
-            mkdir -p ~/.android
-            printf '%s' "${DEBUG_KEYSTORE_B64}" | base64 -d > ~/.android/debug.keystore
+            KS="${RUNNER_TEMP}/fusion-debug.keystore"
+            printf '%s' "${DEBUG_KEYSTORE_B64}" | tr -d ' \r\n' | base64 -d > "$KS"
+            keytool -list -v -keystore "$KS" -storepass android -alias androiddebugkey 2>/dev/null | grep -E "SHA256:" \
+              || { echo "::error::DEBUG_KEYSTORE_B64 does not decode to a keystore with alias androiddebugkey and password android"; exit 1; }
+            echo "FUSION_DEBUG_KEYSTORE=$KS" >> "$GITHUB_ENV"
             echo "Using the fixed debug key from DEBUG_KEYSTORE_B64"
           else
             echo "::warning::DEBUG_KEYSTORE_B64 is not set. This APK gets a new debug key and will not install over the previous build."
