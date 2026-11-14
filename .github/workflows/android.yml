@@ -21,17 +21,26 @@ jobs:
     env:
       BUILD_TOOLS: '35.0.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
+      # The runner image already ships the Android SDK. android-actions/setup-android@v3
+      # fails because it installs the removed 'tools' package, so use the preinstalled sdkmanager.
       - name: Install SDK platform 35 and build tools
-        run: sdkmanager 'platforms;android-35' "build-tools;${BUILD_TOOLS}"
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          test -d "$SDK" || { echo "::error::Android SDK not found on runner"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install 'platforms;android-35' "build-tools;${BUILD_TOOLS}" 'platform-tools'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -50,11 +59,11 @@ jobs:
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
           test -s "$APK" || { echo "::error::Debug APK was not produced at $APK"; exit 1; }
-          SIGNER="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools/${BUILD_TOOLS}/apksigner"
+          SIGNER="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}/apksigner"
           "$SIGNER" verify --verbose --print-certs "$APK" | tee apksigner.txt
           grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" apksigner.txt \
             || { echo "::error::APK signature scheme v2 verification failed"; exit 1; }
-          AAPT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools/${BUILD_TOOLS}/aapt2"
+          AAPT="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}/aapt2"
           "$AAPT" dump badging "$APK" | head -3
           {
             echo "### LaserPlan Fusion debug APK"
