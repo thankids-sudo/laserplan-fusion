@@ -1,0 +1,289 @@
+package app.laserplan.survey;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.media.Image;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
+import android.os.Bundle;
+import android.widget.*;
+import com.google.ar.core.*;
+import com.google.ar.core.exceptions.NotYetAvailableException;
+import java.io.File;
+import java.nio.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
+
+public final class ScanActivity extends Activity implements GLSurfaceView.Renderer {
+    private final ExecutorService writer=Executors.newSingleThreadExecutor();
+    private final FloatBuffer quad=buffer(-1,-1, 1,-1, -1,1, 1,1);
+    private final FloatBuffer uv=buffer(0,0,0,0,0,0,0,0);
+    private GLSurfaceView surface;
+    private TextView status;
+    private Button start,pause,finish;
+    private Spinner confidence,range,interval;
+    private volatile Session session;
+    private int texture,program,width,height,rotation;
+    private boolean installRequested;
+    private volatile boolean recording,busy,saving;
+    private volatile Capture capture;
+    private long lastAccepted,lastRaw,lastStatus;
+    private volatile int accepted,timingRejected;
+
+    @Override public void onCreate(Bundle state){
+        super.onCreate(state);
+        LinearLayout layout=new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        status=new TextView(this);
+        status.setPadding(16,12,16,12);
+        status.setText("Starting AR camera…");
+        layout.addView(status);
+        surface=new GLSurfaceView(this);
+        surface.setEGLContextClientVersion(2);
+        surface.setRenderer(this);
+        surface.onPause();
+        layout.addView(surface,new LinearLayout.LayoutParams(-1,0,1));
+        confidence=selector(layout,"Min. confidence","96","128","192"); confidence.setSelection(1);
+        range=selector(layout,"Max. depth","3 m","5 m","8 m"); range.setSelection(1);
+        interval=selector(layout,"Frame interval","300 ms","600 ms","1000 ms"); interval.setSelection(1);
+        LinearLayout buttons=new LinearLayout(this);
+        start=button(buttons,"Start");
+        pause=button(buttons,"Pause");
+        finish=button(buttons,"Finish & view");
+        start.setEnabled(false);pause.setEnabled(false);finish.setEnabled(false);
+        layout.addView(buttons);
+        setContentView(layout);
+        start.setOnClickListener(v->begin());
+        pause.setOnClickListener(v->{
+            recording=!recording;
+            pause.setText(recording?"Pause":"Resume");
+            if(!recording) status.setText("Paused · "+accepted+" frames captured");
+        });
+        finish.setOnClickListener(v->complete());
+    }
+
+    private Spinner selector(LinearLayout parent,String label,String... choices){
+        LinearLayout row=new LinearLayout(this);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        TextView title=new TextView(this);
+        title.setText(label);
+        title.setPadding(16,0,8,0);
+        row.addView(title,new LinearLayout.LayoutParams(0,-2,1));
+        Spinner picker=new Spinner(this);
+        ArrayAdapter<String> adapter=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,choices);
+        picker.setAdapter(adapter);
+        row.addView(picker);
+        parent.addView(row);
+        return picker;
+    }
+    private Button button(LinearLayout row,String title){
+        Button b=new Button(this);b.setText(title);
+        row.addView(b,new LinearLayout.LayoutParams(0,-2,1));
+        return b;
+    }
+
+    @Override protected void onResume(){super.onResume();openSession();}
+    private void openSession(){
+        if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.CAMERA},1);return;
+        }
+        try{
+            if(session==null){
+                if(ArCoreApk.getInstance().requestInstall(this,!installRequested)==ArCoreApk.InstallStatus.INSTALL_REQUESTED){
+                    installRequested=true;return;
+                }
+                session=new Session(this);
+                if(!session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)){
+                    session.close();session=null;
+                    status.setText("ARCore Depth is unavailable on this device.");return;
+                }
+                Config config=new Config(session);
+                config.setDepthMode(Config.DepthMode.AUTOMATIC);
+                config.setFocusMode(Config.FocusMode.AUTO);
+                session.configure(config);
+            }
+            session.resume();
+            surface.onResume();
+            start.setEnabled(capture==null);
+            status.setText(capture==null?"Move slowly to establish tracking.":"Paused · "+accepted+" frames captured");
+        }catch(Exception e){status.setText("Could not start AR camera: "+e.getMessage());}
+    }
+    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){
+        super.onRequestPermissionsResult(request,permissions,results);
+        if(request!=1)return;
+        if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED){
+            if(session==null)openSession();
+        }else status.setText("Camera permission is required for scanning.");
+    }
+    @Override protected void onPause(){
+        recording=false;
+        if(capture!=null&&!saving)pause.setText("Resume");
+        surface.onPause();
+        if(session!=null)session.pause();
+        super.onPause();
+    }
+    @Override protected void onDestroy(){
+        if(session!=null) session.close();
+        writer.execute(()->{if(capture!=null)capture.discard();});
+        writer.shutdown();
+        super.onDestroy();
+    }
+    private void begin(){
+        try {
+            capture=new Capture(getCacheDir(),new int[]{96,128,192}[confidence.getSelectedItemPosition()],
+                new int[]{3,5,8}[range.getSelectedItemPosition()],
+                new long[]{300,600,1000}[interval.getSelectedItemPosition()]*1_000_000L);
+            for(android.view.View v:new android.view.View[]{confidence,range,interval,start})v.setEnabled(false);
+            pause.setText("Pause");pause.setEnabled(true);finish.setEnabled(true);
+            recording=true;
+        }catch(Exception e){status.setText(e.getMessage());}
+    }
+    private void complete(){
+        recording=false;
+        saving=true;
+        pause.setEnabled(false);finish.setEnabled(false);
+        status.setText("Preparing survey…");
+        // Queue behind GL acquisition and any outstanding frame write.
+        surface.queueEvent(()->writer.execute(()->{
+            try{
+                if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. Resume and move slowly near a textured surface.");
+                capture.rejected=timingRejected;
+                File zip=capture.finish(new File(getFilesDir(),"LaserPlan-survey-"+System.currentTimeMillis()+".zip"));
+                runOnUiThread(()->{
+                    if(isDestroyed())return;
+                    setResult(RESULT_OK,new Intent().putExtra("survey",zip.getName()));
+                    finish();
+                });
+            }catch(Exception e){
+                runOnUiThread(()->{
+                    saving=false;pause.setText("Resume");pause.setEnabled(true);
+                    finish.setEnabled(true);status.setText(e.getMessage());
+                });
+            }
+        }));
+    }
+    @Override public void onSurfaceCreated(GL10 unused,EGLConfig config){
+        int[] id=new int[1];
+        GLES20.glGenTextures(1,id,0);texture=id[0];
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
+        for(int p:new int[]{GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_TEXTURE_MAG_FILTER})
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,p,GLES20.GL_LINEAR);
+        for(int p:new int[]{GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_TEXTURE_WRAP_T})
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,p,GLES20.GL_CLAMP_TO_EDGE);
+        program=GLES20.glCreateProgram();
+        GLES20.glAttachShader(program,shader(GLES20.GL_VERTEX_SHADER,
+            "attribute vec2 pos, tex; varying vec2 uv; void main(){uv=tex;gl_Position=vec4(pos,0.,1.);}"));
+        GLES20.glAttachShader(program,shader(GLES20.GL_FRAGMENT_SHADER,
+            "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 uv; uniform samplerExternalOES camera; void main(){gl_FragColor=texture2D(camera,uv);}"));
+        GLES20.glLinkProgram(program);
+    }
+    private static int shader(int type,String source){
+        int id=GLES20.glCreateShader(type);
+        GLES20.glShaderSource(id,source);GLES20.glCompileShader(id);
+        return id;
+    }
+    private static FloatBuffer buffer(float... data){
+        FloatBuffer b=ByteBuffer.allocateDirect(data.length*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        b.put(data);b.position(0);return b;
+    }
+    @Override public void onSurfaceChanged(GL10 unused,int w,int h){
+        width=w;height=h;rotation=-1;
+        GLES20.glViewport(0,0,w,h);
+    }
+    @Override public void onDrawFrame(GL10 unused){
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+        if(session==null||width==0)return;
+        try{
+            int current=getWindowManager().getDefaultDisplay().getRotation();
+            if(current!=rotation){session.setDisplayGeometry(current,width,height);rotation=current;}
+            session.setCameraTextureName(texture);
+            Frame frame=session.update();
+            if(frame.getTimestamp()==0)return;
+            quad.position(0);uv.position(0);
+            frame.transformCoordinates2d(Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,quad,
+                    Coordinates2d.TEXTURE_NORMALIZED,uv);
+            drawCamera();
+            if(recording&&!busy)acquire(frame);
+            long now=android.os.SystemClock.uptimeMillis();
+            if(!saving&&now-lastStatus>350&&(recording||capture==null)){
+                lastStatus=now;
+                boolean tracked=frame.getCamera().getTrackingState()==TrackingState.TRACKING;
+                runOnUiThread(()->{
+                    if(saving||(!recording&&capture!=null))return;
+                    status.setText((tracked?"Tracking":"Move slowly to recover tracking")
+                            +" · "+accepted+" captured · "+timingRejected+" timing skips");
+                });
+            }
+        }catch(Exception e){recording=false;runOnUiThread(()->{
+            status.setText("AR camera error: "+e.getMessage());
+            if(capture!=null&&!saving)pause.setText("Resume");
+        });}
+    }
+    private void drawCamera(){
+        GLES20.glUseProgram(program);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"camera"),0);
+        int p=GLES20.glGetAttribLocation(program,"pos"), t=GLES20.glGetAttribLocation(program,"tex");
+        quad.position(0);uv.position(0);
+        GLES20.glVertexAttribPointer(p,2,GLES20.GL_FLOAT,false,0,quad);
+        GLES20.glVertexAttribPointer(t,2,GLES20.GL_FLOAT,false,0,uv);
+        GLES20.glEnableVertexAttribArray(p);GLES20.glEnableVertexAttribArray(t);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
+    }
+    private void acquire(Frame frame) throws Exception{
+        Capture target=capture;
+        long time=frame.getTimestamp();
+        Camera camera=frame.getCamera();
+        if(camera.getTrackingState()!=TrackingState.TRACKING||time-lastAccepted<target.interval)return;
+        try(Image depth=frame.acquireRawDepthImage16Bits();Image conf=frame.acquireRawDepthConfidenceImage()){
+            long rawTime=depth.getTimestamp();
+            if(rawTime==lastRaw)return;
+            lastRaw=rawTime;
+            if(Math.abs(time-rawTime)>Capture.MAX_DELTA||conf.getTimestamp()!=rawTime){
+                timingRejected++;return;
+            }
+            int w=depth.getWidth(),h=depth.getHeight();
+            if(w!=conf.getWidth()||h!=conf.getHeight())return;
+            byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
+            float[] k=Capture.calibration(camera.getTextureIntrinsics(),w,h),pose=new float[16];
+            camera.getPose().toMatrix(pose,0);
+            byte[] color=null;int rw=0,rh=0;float[] rgbK=null;
+            if(accepted%3==0){
+                try(Image rgb=frame.acquireCameraImage()){
+                    if(Math.abs(rgb.getTimestamp()-time)<=Capture.MAX_DELTA){
+                        rw=rgb.getWidth();rh=rgb.getHeight();
+                        rgbK=Capture.calibration(camera.getImageIntrinsics(),rw,rh);
+                        color=Capture.jpeg(rgb);
+                    }
+                }catch(NotYetAvailableException ignored){}
+            }
+            final byte[] jpeg=color; final int photoW=rw,photoH=rh; final float[] photoK=rgbK;
+            lastAccepted=time;
+            busy=true;
+            writer.execute(()->{
+                try{
+                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,jpeg,photoW,photoH,photoK);
+                    accepted=target.frames;
+                    if(accepted>=Capture.MAX_FRAMES){
+                        recording=false;
+                        runOnUiThread(()->{
+                            pause.setEnabled(false);
+                            status.setText("90 frames captured. Tap Finish & view.");
+                        });
+                    }
+                }catch(Exception e){
+                    recording=false;
+                    runOnUiThread(()->{
+                        pause.setEnabled(false);status.setText("Capture stopped: "+e.getMessage());
+                    });
+                }finally{busy=false;}
+            });
+        }catch(NotYetAvailableException ignored){}
+    }
+}

@@ -1,0 +1,16 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+android {
+    namespace 'app.laserplan.survey'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'app.laserplan.fusion'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.2'
+    }
+}
+
+dependencies { implementation 'com.google.ar:core:1.48.0' }
