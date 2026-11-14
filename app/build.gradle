@@ -8,9 +8,17 @@ android {
         applicationId 'app.laserplan.fusion'
         minSdk 26
         targetSdk 34
-        versionCode 6
-        versionName '0.7'
+        versionCode 7
+        versionName '0.8'
     }
+    // standard: no AI model (small APK). ai: adds MiDaS v2.1 Small (MIT) for the optional AI depth fill;
+    // CI downloads the model from the official MiDaS release and checks its SHA-256 (never committed).
+    flavorDimensions 'model'
+    productFlavors {
+        standard { dimension 'model' }
+        ai { dimension 'model'; versionNameSuffix '-ai' }
+    }
+    androidResources { noCompress += 'tflite' }
     // CI sets FUSION_DEBUG_KEYSTORE (from the DEBUG_KEYSTORE_B64 secret) so every debug APK has the
     // same signature and installs over the previous one. Local builds keep the normal debug key.
     signingConfigs {
@@ -28,5 +36,6 @@ android {
 
 dependencies {
     implementation 'com.google.ar:core:1.48.0'
+    aiImplementation 'org.tensorflow:tensorflow-lite:2.16.1'
     testImplementation 'junit:junit:4.13.2'
 }

@@ -7,6 +7,7 @@ import android.view.View;
 import android.widget.*;
 import java.io.*;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 
@@ -17,6 +18,11 @@ public final class MainActivity extends Activity {
     private File selected;
     private int generation,mode,smoothing=2,fill=1;
     private Fusion current;
+    private DepthModel depthModel;
+    private boolean aiEnabled;
+    private volatile Fusion.AiResult ai;
+    private volatile Fusion aiFor;
+    private volatile String aiReport="";
     private LinearLayout surfaceControls;
 
     @Override public void onCreate(Bundle state){
@@ -49,6 +55,15 @@ public final class MainActivity extends Activity {
         SeekBar smooth=slider(sliders,"Smoothing",smoothing);
         SeekBar estimate=slider(sliders,"Estimated fill",fill);
         surfaceControls.addView(sliders);
+        // Optional AI depth fill (ai build only). Off by default; its output is always labelled an estimate.
+        depthModel=DepthModels.open(this);
+        if(depthModel!=null){
+            CheckBox aiBox=new CheckBox(this);
+            aiBox.setText("AI depth fill (estimate) · large enclosed holes only");
+            aiBox.setChecked(false);
+            aiBox.setOnCheckedChangeListener((box,on)->{aiEnabled=on;buildSurface();});
+            surfaceControls.addView(aiBox);
+        }
         surfaceControls.setVisibility(View.GONE);
         root.addView(surfaceControls);
         SeekBar.OnSeekBarChangeListener rebuild=new SeekBar.OnSeekBarChangeListener(){
@@ -91,25 +106,38 @@ public final class MainActivity extends Activity {
         legend.setText(new String[]{"Measured points, original positions · metres",
                 "Points coloured from visible photos"+(approx?" · APPROXIMATE alignment (older ZIP without photo calibration)":""),
                 "Surface from measured depth · edges and gaps kept open · amber in Coverage = estimated",
-                "Mint: photo sampled · Amber: estimated (fill or colour) · Grey: no photo"}[mode]);
+                "Mint: photo sampled · Amber: estimated (fill or colour) · Violet: AI estimate · Grey: no photo"}[mode]
+                +(mode>=ScanView.SURFACE&&aiEnabled?"\n"+aiReport:""));
     }
     private void labelSurface(SurfaceBuilder.Mesh mesh){
         String settings="Smoothing "+smoothing+" · Estimated fill "+fill;
         if(mesh==null){surfaceLabel.setText(settings);return;}
         float t=Math.max(1,mesh.triangles);
-        surfaceLabel.setText(String.format(java.util.Locale.US,"%s · %,d triangles · photo %.0f%% · estimated %.0f%% · no photo %.0f%%",
-                settings,mesh.triangles,100*mesh.photo/t,100*mesh.estimated/t,100*mesh.uncovered/t));
+        surfaceLabel.setText(String.format(java.util.Locale.US,"%s · %,d triangles · photo %.0f%% · estimated %.0f%%%s · no photo %.0f%%",
+                settings,mesh.triangles,100*mesh.photo/t,100*mesh.estimated/t,
+                mesh.model>0?String.format(java.util.Locale.US," · AI estimate %.0f%%",100*mesh.model/t):"",100*mesh.uncovered/t));
     }
     private void buildSurface(){
         Fusion data=current;
         if(data==null)return;
         int request=generation,s=smoothing,f=fill;
-        surfaceLabel.setText("Building surface…");
+        boolean useAi=aiEnabled&&depthModel!=null;
+        surfaceLabel.setText(useAi&&aiFor!=data?"Running AI depth model on photos…":"Building surface…");
         jobs.execute(()->{
-            SurfaceBuilder.Mesh mesh=data.surface(s,f);
+            List<SurfaceBuilder.Frame> extra=null;
+            if(useAi){
+                if(aiFor!=data){
+                    ai=data.aiFrames(depthModel);aiFor=data;
+                    aiReport=String.format(java.util.Locale.US,
+                        "AI estimate: %s · %d photos, %d fitted · %,d cells filled · model %d ms total (%d ms/photo) · %d ms with fitting",
+                        ai.model,ai.photos,ai.fitted,ai.cells,ai.inferenceMs,ai.photos==0?0:ai.inferenceMs/ai.photos,ai.totalMs);
+                }
+                extra=ai.frames;
+            }
+            SurfaceBuilder.Mesh mesh=data.surface(s,f,extra);
             runOnUiThread(()->{
                 if(isDestroyed()||request!=generation||data!=current)return;
-                view.setMesh(mesh);labelSurface(mesh);
+                view.setMesh(mesh);labelSurface(mesh);updateLegend();
             });
         });
     }
@@ -120,7 +148,10 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume(){super.onResume();view.onResume();}
     @Override protected void onPause(){view.onPause();super.onPause();}
-    @Override protected void onDestroy(){jobs.shutdown();super.onDestroy();}
+    @Override protected void onDestroy(){
+        jobs.execute(()->{if(depthModel!=null)depthModel.close();});
+        jobs.shutdown();super.onDestroy();
+    }
 
     private void picker(boolean export){
         if(export&&selected==null){status.setText("Choose a scan first.");return;}
