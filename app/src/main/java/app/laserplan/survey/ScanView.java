@@ -10,7 +10,9 @@ import javax.microedition.khronos.opengles.GL10;
 
 final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
     private Fusion scan;
-    private int program,buffer,count,mode;
+    private SurfaceBuilder.Mesh mesh;
+    private int program,buffer,count,mode,meshBuffer,meshCount;
+    static final int RAW=0,PHOTO_POINTS=1,SURFACE=2,COVERAGE=3;
     private float yaw=.4f,pitch=.25f,zoom=1,panX,panY,pointSize=4,aspect=1;
     private float lastX,lastY,lastDistance;
 
@@ -22,8 +24,9 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         setRenderMode(RENDERMODE_WHEN_DIRTY);
     }
 
-    void setScan(Fusion value){update(()->{scan=value;fit();upload();});}
-    void setMode(int value){update(()->{mode=value;upload();});}
+    void setScan(Fusion value){update(()->{scan=value;mesh=null;meshCount=0;fit();upload();});}
+    void setMesh(SurfaceBuilder.Mesh value){update(()->{mesh=value;uploadMesh();});}
+    void setMode(int value){update(()->{mode=value;upload();uploadMesh();});}
     void setSize(float value){update(()->pointSize=value);}
     void reset(){update(this::fit);}
     void top(){update(()->{fit();yaw=0;pitch=(float)Math.PI/2;});}
@@ -42,9 +45,31 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         GLES20.glLinkProgram(program);
         int[] id=new int[1];
         GLES20.glGenBuffers(1,id,0);buffer=id[0];
+        GLES20.glGenBuffers(1,id,0);meshBuffer=id[0];
         GLES20.glEnable(GLES20.GL_DEPTH_TEST);
         GLES20.glClearColor(.045f,.075f,.105f,1);
         upload();
+        uploadMesh();
+    }
+    private static int coverageColor(int source){
+        return source==Fusion.OBSERVED?0xff72d9b2:source==Fusion.ESTIMATED?0xffffb05e:0xff778898;
+    }
+    /** Surface triangles: photo colours, or mint/amber/grey for photo/estimated/uncovered. */
+    private void uploadMesh(){
+        if(meshBuffer==0)return;
+        if(mesh==null||mesh.triangles==0||(mode!=SURFACE&&mode!=COVERAGE)){meshCount=0;return;}
+        meshCount=mesh.triangles*3;
+        FloatBuffer out=ByteBuffer.allocateDirect(meshCount*24).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        for(int v=0;v<meshCount;v++){
+            int source=mesh.source[v];
+            int color=mode==COVERAGE?(source==SurfaceBuilder.PHOTO?0xff72d9b2:source==SurfaceBuilder.ESTIMATED?0xffffb05e:0xff778898)
+                    :mesh.color[v];
+            out.put(mesh.xyz,3*v,3);
+            out.put(((color>>16)&255)/255f).put(((color>>8)&255)/255f).put((color&255)/255f);
+        }
+        out.flip();
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER,meshBuffer);
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER,meshCount*24,out,GLES20.GL_STATIC_DRAW);
     }
     private void attach(int kind,String code){
         int shader=GLES20.glCreateShader(kind);
@@ -60,10 +85,7 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         FloatBuffer out=ByteBuffer.allocateDirect(count*24).order(ByteOrder.nativeOrder()).asFloatBuffer();
         for(int i=0;i<count;i++){
             int color=mode==0?Fusion.NEUTRAL:colors[i];
-            if(mode==3){
-                int source=scan.previewSource[i];
-                color=source==Fusion.OBSERVED?0xff72d9b2:source==Fusion.ESTIMATED?0xffffb05e:0xff778898;
-            }
+            if(mode==COVERAGE)color=coverageColor(scan.previewSource[i]);
             out.put(xyz,3*i,3);
             out.put(((color>>16)&255)/255f).put(((color>>8)&255)/255f).put((color&255)/255f);
         }
@@ -79,7 +101,8 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT|GLES20.GL_DEPTH_BUFFER_BIT);
         if(scan==null||count==0)return;
         GLES20.glUseProgram(program);
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER,buffer);
+        boolean surface=meshCount>0&&(mode==SURFACE||mode==COVERAGE);
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER,surface?meshBuffer:buffer);
         int p=GLES20.glGetAttribLocation(program,"p"), c=GLES20.glGetAttribLocation(program,"c");
         if(p<0||c<0)return;
         GLES20.glEnableVertexAttribArray(p);GLES20.glEnableVertexAttribArray(c);
@@ -92,7 +115,7 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         GLES20.glUniform1f(uniform("scale"),1.25f*zoom*Math.min(1,aspect)/scan.span);
         GLES20.glUniform1f(uniform("aspect"),aspect);
         GLES20.glUniform1f(uniform("size"),pointSize*getResources().getDisplayMetrics().density);
-        GLES20.glDrawArrays(GLES20.GL_POINTS,0,count);
+        GLES20.glDrawArrays(surface?GLES20.GL_TRIANGLES:GLES20.GL_POINTS,0,surface?meshCount:count);
     }
     @Override public boolean onTouchEvent(MotionEvent e){
         int action=e.getActionMasked();

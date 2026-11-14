@@ -15,6 +15,12 @@ final class Fusion {
     final float[] xyz, smooth, center;
     final int[] colors, source, previewColors, previewSource;
     int photoFrames, observed, estimated;
+    /** Depth frames kept for the surface preview. */
+    final List<SurfaceBuilder.Frame> depthFrames=new ArrayList<>();
+    /** True when any photo had to use the approximate (crop) alignment of older ZIPs. */
+    boolean approximateAlignment;
+    int minConfidence=128;
+    float maxRange=5;
     float span=.1f;
     private final HashMap<Long,Integer> cells=new HashMap<>();
     private final float voxel;
@@ -69,18 +75,30 @@ final class Fusion {
             }
             if(size==0)throw new IOException("No points in this scan.");
             Fusion result=new Fusion(Arrays.copyOf(points,size),voxel);
+            result.minConfidence=Math.max(0,Math.min(255,settings.optInt("minConfidence",128)));
+            result.maxRange=(float)Math.max(.5,Math.min(20,settings.optDouble("maxRangeM",5)));
             float[][] votes=new float[4][size/3];
+            float[] depthScratch=new float[size/3];
+            int[] pixelScratch=new int[size/3];
             int n=0;
+            List<String> names=new ArrayList<>();
             for(Enumeration<? extends ZipEntry> entries=zip.entries();entries.hasMoreElements();){
                 String name=entries.nextElement().getName();
-                if(!name.matches("frames/[0-9]+[.]json"))continue;
+                if(name.matches("frames/[0-9]+[.]json"))names.add(name);
+            }
+            Collections.sort(names);
+            for(String name:names){
                 if(++n>300)throw new IOException("Too many scan frames.");
                 JSONObject frame=json(zip,name);
-                if(!frame.optBoolean("valid")||Math.abs(frame.optDouble("depthToCameraDeltaNs",Double.POSITIVE_INFINITY))>
-                    Math.min(50_000_000,settings.optDouble("maxDepthPoseDeltaNs",50_000_000)))continue;
+                if(!frame.optBoolean("valid"))continue;
+                // A depth frame whose pose was matched to its own camera frame is usable at any lag;
+                // otherwise (older or approximate captures) only within 50 ms of the live pose.
+                double lag=Math.abs(frame.optDouble("depthToCameraDeltaNs",0));
+                if(!poseMatched(frame)&&lag>50_000_000)continue;
+                try{result.depthFrames.add(depthFrame(zip,frame));}catch(Exception skipped){continue;}
                 JSONObject rgb=frame.optJSONObject("rgb");
                 if(rgb==null||!rgb.has("file")||zip.getEntry(rgb.optString("file"))==null)continue;
-                if(result.project(zip,frame,rgb,settings.optInt("minConfidence",128),votes))result.photoFrames++;
+                if(result.project(zip,frame,rgb,votes,depthScratch,pixelScratch))result.photoFrames++;
             }
             for(int i=0;i<result.colors.length;i++){
                 float w=votes[3][i];
@@ -93,64 +111,101 @@ final class Fusion {
         }
     }
 
-    private boolean project(ZipFile zip,JSONObject frame,JSONObject rgb,int confidence,float[][] votes) throws Exception {
+    static boolean poseMatched(JSONObject frame){
+        JSONObject pose=frame.optJSONObject("pose");
+        String source=pose==null?"":pose.optString("source");
+        return source.equals("matched-frame")||source.contains("the depth image belongs to");
+    }
+
+    private static double[] matrix(JSONArray values) throws Exception{
+        if(values==null||values.length()!=16)return null;
+        double[] m=new double[16];
+        for(int i=0;i<16;i++){m[i]=values.getDouble(i);if(!Double.isFinite(m[i]))return null;}
+        return m;
+    }
+
+    private static SurfaceBuilder.Frame depthFrame(ZipFile zip,JSONObject frame) throws Exception{
         JSONObject d=frame.getJSONObject("intrinsics").getJSONObject("depth");
         int w=d.getInt("width"),h=d.getInt("height");
         if(w<2||h<2||(long)w*h>500000)throw new IOException("Invalid depth dimensions.");
         byte[] depth=bytes(zip,frame.getJSONObject("depth").getString("file"),2*w*h);
-        byte[] conf=bytes(zip,frame.getJSONObject("confidence").getString("file"),w*h);
-        if(depth.length!=2*w*h||conf.length!=w*h)throw new IOException("Truncated depth frame.");
-        JSONArray matrix=frame.getJSONObject("pose").getJSONArray("matrixColumnMajor");
-        double[] m=new double[16];
-        for(int i=0;i<16;i++)m[i]=matrix.getDouble(i);
-        double fx=d.getDouble("fx"),fy=d.getDouble("fy"),cx=d.getDouble("cx"),cy=d.getDouble("cy");
-        if(fx<=0||fy<=0)throw new IOException("Invalid camera focal length.");
+        if(depth.length!=2*w*h)throw new IOException("Truncated depth frame.");
+        SurfaceBuilder.Frame f=new SurfaceBuilder.Frame();
+        f.width=w;f.height=h;
+        f.depthMm=new short[w*h];
+        java.nio.ByteBuffer.wrap(depth).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(f.depthMm);
+        JSONObject conf=frame.optJSONObject("confidence");
+        if(conf!=null&&conf.has("file")){
+            byte[] c=bytes(zip,conf.getString("file"),w*h);
+            if(c.length==w*h)f.confidence=c;
+        }
+        f.pose=matrix(frame.getJSONObject("pose").getJSONArray("matrixColumnMajor"));
+        if(f.pose==null)throw new IOException("Invalid pose.");
+        f.fx=d.getDouble("fx");f.fy=d.getDouble("fy");f.cx=d.getDouble("cx");f.cy=d.getDouble("cy");
+        if(f.fx<=0||f.fy<=0)throw new IOException("Invalid camera focal length.");
+        JSONObject pixels=frame.optJSONObject("pixels");
+        f.measured=pixels==null?0:pixels.optInt("accepted",0);
+        return f;
+    }
+
+    /**
+     * Colours the cloud from one photo. A point takes this photo's colour only when it is the visible
+     * surface in that photo: a depth buffer of the cloud itself (8 px cells) rejects points hidden behind
+     * nearer ones. Samples are weighted by 1/distance² so close, sharp views dominate the blend.
+     */
+    private boolean project(ZipFile zip,JSONObject frame,JSONObject rgb,float[][] votes,float[] pz,int[] pp) throws Exception {
         byte[] photo=bytes(zip,rgb.getString("file"),12<<20);
         BitmapFactory.Options bounds=new BitmapFactory.Options();
         bounds.inJustDecodeBounds=true;
         BitmapFactory.decodeByteArray(photo,0,photo.length,bounds);
         int rw=bounds.outWidth,rh=bounds.outHeight;
         if(rw<1||rh<1||(long)rw*rh>12_000_000||rw!=rgb.optInt("width")||rh!=rgb.optInt("height"))return false;
+        JSONObject d=frame.getJSONObject("intrinsics").getJSONObject("depth");
+        int w=d.getInt("width"),h=d.getInt("height");
+        double fx=d.getDouble("fx"),fy=d.getDouble("fy"),cx=d.getDouble("cx"),cy=d.getDouble("cy");
+        JSONObject k=rgb.optJSONObject("intrinsics");
+        double rfx,rfy,rcx,rcy;
+        if(k!=null){rfx=k.getDouble("fx");rfy=k.getDouble("fy");rcx=k.getDouble("cx");rcy=k.getDouble("cy");}
+        else{
+            // Older LaserPlan ZIPs have no photo calibration: centred-crop estimate, labelled approximate.
+            double crop=Math.max((double)rw/w,(double)rh/h);
+            rfx=fx*crop;rfy=fy*crop;rcx=(cx+.5-w*.5)*crop+rw*.5-.5;rcy=(cy+.5-h*.5)*crop+rh*.5-.5;
+            approximateAlignment=true;
+        }
+        if(rfx<=0||rfy<=0)return false;
+        // Photo pose: Fusion stores rgb.pose.matrixColumnMajor, LaserPlan 13.2 rgb.poseMatrixColumnMajor.
+        JSONObject rp=rgb.optJSONObject("pose");
+        double[] r=matrix(rp!=null?rp.optJSONArray("matrixColumnMajor"):rgb.optJSONArray("poseMatrixColumnMajor"));
+        if(r==null){r=matrix(frame.getJSONObject("pose").getJSONArray("matrixColumnMajor"));approximateAlignment=true;}
+        if(r==null)return false;
         Bitmap image=BitmapFactory.decodeByteArray(photo,0,photo.length);
         if(image==null)return false;
         try{
             int[] pixels=new int[rw*rh];
             image.getPixels(pixels,0,rw,0,0,rw,rh);
-            JSONObject k=rgb.optJSONObject("intrinsics");
-            // Older LaserPlan exports lack RGB intrinsics. Use a centered crop preview.
-            double crop=Math.max((double)rw/w,(double)rh/h);
-            double rfx=k==null?fx*crop:k.getDouble("fx"),rfy=k==null?fy*crop:k.getDouble("fy");
-            double rcx=k==null?(cx+.5-w*.5)*crop+rw*.5-.5:k.getDouble("cx");
-            double rcy=k==null?(cy+.5-h*.5)*crop+rh*.5-.5:k.getDouble("cy");
-            // Newer captures store the photo's own pose; older ones share the depth pose.
-            double[] r=m;
-            JSONObject rgbPose=rgb.optJSONObject("pose");
-            JSONArray rgbMatrix=rgbPose==null?null:rgbPose.optJSONArray("matrixColumnMajor");
-            if(rgbMatrix!=null&&rgbMatrix.length()==16){
-                r=new double[16];
-                for(int i=0;i<16;i++)r[i]=rgbMatrix.getDouble(i);
+            int gw=(rw+7)/8,gh=(rh+7)/8;
+            float[] nearest=new float[gw*gh];
+            Arrays.fill(nearest,Float.MAX_VALUE);
+            int count=colors.length;
+            for(int i=0;i<count;i++){
+                pp[i]=-1;
+                double x=xyz[3*i]-r[12],y=xyz[3*i+1]-r[13],z=xyz[3*i+2]-r[14];
+                double a=r[0]*x+r[1]*y+r[2]*z,b=r[4]*x+r[5]*y+r[6]*z,c=-(r[8]*x+r[9]*y+r[10]*z);
+                if(c<=.1)continue;
+                double u=rfx*a/c+rcx,v=rcy-rfy*b/c;
+                if(u<0||v<0||u>=rw-1||v>=rh-1)continue;
+                int px=(int)u,py=(int)v,g=(py>>3)*gw+(px>>3);
+                pp[i]=py*rw+px;pz[i]=(float)c;
+                if(c<nearest[g])nearest[g]=(float)c;
             }
             boolean contributed=false;
-            for(int i=0;i<colors.length;i++){
-                double x=xyz[3*i]-m[12],y=xyz[3*i+1]-m[13],z=xyz[3*i+2]-m[14];
-                double a=m[0]*x+m[1]*y+m[2]*z,b=-(m[4]*x+m[5]*y+m[6]*z),c=-(m[8]*x+m[9]*y+m[10]*z);
-                if(c<=.1)continue;
-                int u=(int)Math.round(fx*a/c+cx),v=(int)Math.round(fy*b/c+cy);
-                if(u<0||v<0||u>=w||v>=h)continue;
-                int at=v*w+u, quality=conf[at]&255;
-                double measured=((depth[2*at]&255)|((depth[2*at+1]&255)<<8))*.001;
-                double tolerance=Math.max(.028,.018*c), error=Math.abs(c-measured);
-                if(quality<confidence||measured==0||error>=tolerance)continue;
-                double ra=a,rb=b,rc=c;
-                if(r!=m){
-                    double qx=xyz[3*i]-r[12],qy=xyz[3*i+1]-r[13],qz=xyz[3*i+2]-r[14];
-                    ra=r[0]*qx+r[1]*qy+r[2]*qz;rb=-(r[4]*qx+r[5]*qy+r[6]*qz);rc=-(r[8]*qx+r[9]*qy+r[10]*qz);
-                    if(rc<=.1)continue;
-                }
-                int px=(int)Math.round(rfx*ra/rc+rcx),py=(int)Math.round(rfy*rb/rc+rcy);
-                if(px<0||py<0||px>=rw||py>=rh)continue;
-                int color=pixels[py*rw+px];
-                float weight=(float)(quality/255.0*(1-error/tolerance)/(1+c*c*.25));
+            for(int i=0;i<count;i++){
+                if(pp[i]<0)continue;
+                int px=pp[i]%rw,py=pp[i]/rw,g=(py>>3)*gw+(px>>3);
+                float c=pz[i];
+                if(c>nearest[g]+.05f+.02f*c)continue;   // hidden behind a nearer surface in this photo
+                int color=pixels[pp[i]];
+                float weight=1f/(Math.max(c,.3f)*Math.max(c,.3f));
                 votes[0][i]+=weight*Color.red(color);
                 votes[1][i]+=weight*Color.green(color);
                 votes[2][i]+=weight*Color.blue(color);
@@ -159,6 +214,25 @@ final class Fusion {
             }
             return contributed;
         }finally{image.recycle();}
+    }
+
+    /** Fused colour near a position for the surface (photo or estimated); 0 when nothing within 3 cm. */
+    int colorNear(float x,float y,float z,int[] sourceOut){
+        long bx=(long)Math.floor(x/voxel),by=(long)Math.floor(y/voxel),bz=(long)Math.floor(z/voxel);
+        int best=-1;float bestDistance=.03f*.03f;
+        for(int dx=-1;dx<=1;dx++)for(int dy=-1;dy<=1;dy++)for(int dz=-1;dz<=1;dz++){
+            Integer j=cells.get(((bx+dx)&0x1fffffL)<<42|((by+dy)&0x1fffffL)<<21|((bz+dz)&0x1fffffL));
+            if(j==null||previewSource[j]==UNKNOWN)continue;
+            float a=xyz[3*j]-x,b=xyz[3*j+1]-y,c=xyz[3*j+2]-z,dd=a*a+b*b+c*c;
+            if(dd<bestDistance){bestDistance=dd;best=j;}
+        }
+        if(best<0)return 0;
+        sourceOut[0]=previewSource[best]==OBSERVED?SurfaceBuilder.PHOTO:SurfaceBuilder.ESTIMATED;
+        return previewColors[best];
+    }
+
+    SurfaceBuilder.Mesh surface(int smoothing,int fill){
+        return SurfaceBuilder.build(depthFrames,this::colorNear,smoothing,fill,minConfidence,maxRange,300_000);
     }
 
     private void preparePreview(){

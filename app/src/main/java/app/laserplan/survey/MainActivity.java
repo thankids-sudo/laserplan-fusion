@@ -13,9 +13,11 @@ import java.util.concurrent.ExecutorService;
 public final class MainActivity extends Activity {
     private final ExecutorService jobs=Executors.newSingleThreadExecutor();
     private ScanView view;
-    private TextView status,legend;
+    private TextView status,legend,surfaceLabel;
     private File selected;
-    private int generation;
+    private int generation,mode,smoothing=2,fill=1;
+    private Fusion current;
+    private LinearLayout surfaceControls;
 
     @Override public void onCreate(Bundle state){
         super.onCreate(state);
@@ -28,7 +30,7 @@ public final class MainActivity extends Activity {
         root.addView(actions);
         Spinner modes=new Spinner(this);
         modes.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"Raw geometry","Photo projection","Smooth + estimate","Coverage map"}));
+                new String[]{"Raw points","Photo points","Photo surface","Coverage"}));
         root.addView(modes);
         view=new ScanView(this);
         root.addView(view,new LinearLayout.LayoutParams(-1,0,1));
@@ -39,17 +41,36 @@ public final class MainActivity extends Activity {
         size.setContentDescription("Point size");
         controls.addView(size,new LinearLayout.LayoutParams(0,-2,2));
         root.addView(controls);
+        // Surface controls: smoothing (edge-preserving) and estimated fill (only holes bounded by measured depth).
+        surfaceControls=new LinearLayout(this);surfaceControls.setOrientation(LinearLayout.VERTICAL);
+        surfaceLabel=new TextView(this);surfaceLabel.setPadding(16,4,16,0);
+        surfaceControls.addView(surfaceLabel);
+        LinearLayout sliders=new LinearLayout(this);
+        SeekBar smooth=slider(sliders,"Smoothing",smoothing);
+        SeekBar estimate=slider(sliders,"Estimated fill",fill);
+        surfaceControls.addView(sliders);
+        surfaceControls.setVisibility(View.GONE);
+        root.addView(surfaceControls);
+        SeekBar.OnSeekBarChangeListener rebuild=new SeekBar.OnSeekBarChangeListener(){
+            public void onProgressChanged(SeekBar bar,int progress,boolean user){
+                if(bar==smooth)smoothing=progress;else fill=progress;
+                labelSurface(null);
+            }
+            public void onStartTrackingTouch(SeekBar bar){}
+            public void onStopTrackingTouch(SeekBar bar){buildSurface();}
+        };
+        smooth.setOnSeekBarChangeListener(rebuild);estimate.setOnSeekBarChangeListener(rebuild);
+        labelSurface(null);
         status=new TextView(this);status.setPadding(16,8,16,8);
         status.setText("Start an AR scan or open a LaserPlan ZIP.");root.addView(status);
         legend=new TextView(this);legend.setPadding(16,0,16,12);root.addView(legend);
         modes.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){
             public void onNothingSelected(AdapterView<?> parent){}
             public void onItemSelected(AdapterView<?> parent,View v,int index,long id){
+                mode=index;
                 view.setMode(index);
-                legend.setText(new String[]{"Original 3D positions · metres",
-                        "Photo samples · older ZIPs use approximate crop alignment",
-                        "Smoothed geometry and locally estimated color",
-                        "Mint: photo sampled · Amber: estimated · Gray: no color"}[index]);
+                surfaceControls.setVisibility(index>=ScanView.SURFACE?View.VISIBLE:View.GONE);
+                updateLegend();
             }
         });
         size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
@@ -58,6 +79,39 @@ public final class MainActivity extends Activity {
             public void onStopTrackingTouch(SeekBar bar){}
         });
         setContentView(root);
+    }
+
+    private SeekBar slider(LinearLayout row,String name,int value){
+        SeekBar bar=new SeekBar(this);bar.setMax(4);bar.setProgress(value);bar.setContentDescription(name);
+        row.addView(bar,new LinearLayout.LayoutParams(0,-2,1));
+        return bar;
+    }
+    private void updateLegend(){
+        boolean approx=current!=null&&current.approximateAlignment;
+        legend.setText(new String[]{"Measured points, original positions · metres",
+                "Points coloured from visible photos"+(approx?" · APPROXIMATE alignment (older ZIP without photo calibration)":""),
+                "Surface from measured depth · edges and gaps kept open · amber in Coverage = estimated",
+                "Mint: photo sampled · Amber: estimated (fill or colour) · Grey: no photo"}[mode]);
+    }
+    private void labelSurface(SurfaceBuilder.Mesh mesh){
+        String settings="Smoothing "+smoothing+" · Estimated fill "+fill;
+        if(mesh==null){surfaceLabel.setText(settings);return;}
+        float t=Math.max(1,mesh.triangles);
+        surfaceLabel.setText(String.format(java.util.Locale.US,"%s · %,d triangles · photo %.0f%% · estimated %.0f%% · no photo %.0f%%",
+                settings,mesh.triangles,100*mesh.photo/t,100*mesh.estimated/t,100*mesh.uncovered/t));
+    }
+    private void buildSurface(){
+        Fusion data=current;
+        if(data==null)return;
+        int request=generation,s=smoothing,f=fill;
+        surfaceLabel.setText("Building surface…");
+        jobs.execute(()->{
+            SurfaceBuilder.Mesh mesh=data.surface(s,f);
+            runOnUiThread(()->{
+                if(isDestroyed()||request!=generation||data!=current)return;
+                view.setMesh(mesh);labelSurface(mesh);
+            });
+        });
     }
 
     private void button(LinearLayout row,String title,Runnable click){
@@ -102,7 +156,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(()->{
                     if(isDestroyed()||request!=generation){if(uri!=null)archive.delete();return;}
                     // Imported ZIPs remain available for export during this app session.
-                    selected=archive;view.setScan(data);
+                    selected=archive;current=data;view.setScan(data);updateLegend();buildSurface();
                     status.setText(String.format(java.util.Locale.US,
                         "%,d points · %d photo frames · %,d photo-sampled · %,d estimated",
                         data.colors.length,data.photoFrames,data.observed,data.estimated));
