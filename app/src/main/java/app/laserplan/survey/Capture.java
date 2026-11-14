@@ -22,7 +22,7 @@ final class Capture {
     final long interval;
     private final File dir;
     private final Map<Long, Sum> voxels = new LinkedHashMap<>();
-    int frames, rejected, depthNotReady, trackingLost;
+    int frames, rejected, depthNotReady, trackingLost, emptyDepth, smoothedHadData;
     long depthLagMs=-1;
     volatile int points;
     volatile long pixelsKept, pixelsZero, pixelsFar, pixelsLowConfidence;
@@ -37,6 +37,18 @@ final class Capture {
         for (String name : new String[]{"frames","depth","confidence","rgb"}) {
             if (!new File(dir, name).mkdir()) throw new IOException("Could not create survey folder");
         }
+    }
+
+    /** Number of non-zero pixels in a 16-bit depth image (any strides). */
+    static int nonZero16(Image image) {
+        Image.Plane plane=image.getPlanes()[0];
+        ByteBuffer src=plane.getBuffer();
+        int origin=src.position(), rowStride=plane.getRowStride(), pixelStride=plane.getPixelStride(), n=0;
+        for (int y=0; y<image.getHeight(); y++) for (int x=0; x<image.getWidth(); x++) {
+            int i=origin+y*rowStride+x*pixelStride;
+            if (src.get(i)!=0 || src.get(i+1)!=0) n++;
+        }
+        return n;
     }
 
     static byte[] pack(Image image, int bytesPerPixel) {
@@ -156,7 +168,8 @@ final class Capture {
                 .put("app",new JSONObject().put("name","LaserPlan Fusion"))
                 .put("frameCount",frames).put("validFrameCount",frames).put("pointCount",voxels.size())
                 .put("rejectedTimingAttempts",rejected).put("photoCount",photos)
-                .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady).put("trackingLostFrames",trackingLost)
+                .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady)
+                      .put("emptyRawDepthImagesSkipped",emptyDepth).put("smoothedDepthHadDataWhenRawEmpty",smoothedHadData).put("trackingLostFrames",trackingLost)
                       .put("lastDepthLagMs",depthLagMs).put("pixelsKept",pixelsKept).put("pixelsNoDepth",pixelsZero)
                       .put("pixelsTooFar",pixelsFar).put("pixelsLowConfidence",pixelsLowConfidence)
                       .put("poseMethod","depth uses the pose of the camera frame matching the depth timestamp (8 ms), else the live pose within 50 ms"))

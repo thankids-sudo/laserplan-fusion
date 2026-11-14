@@ -33,7 +33,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private volatile boolean recording,busy,saving;
     private volatile Capture capture;
     private long lastAccepted,lastRaw,lastStatus;
-    private volatile int accepted,timingRejected,depthNotReady,trackingLost;
+    private volatile int accepted,timingRejected,depthNotReady,trackingLost,emptyDepth,smoothedHadData;
     private volatile long depthLagMs=-1;
     // Recent camera poses by frame timestamp. ARCore's raw depth image usually belongs to an earlier
     // camera frame, so its points must use that frame's pose, not the live one (same approach as LaserPlan 13.2).
@@ -112,7 +112,9 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 }
                 Config config=new Config(session);
                 config.setDepthMode(Config.DepthMode.AUTOMATIC);
-                config.setFocusMode(Config.FocusMode.AUTO);
+                // Fixed focus (ARCore's default), as in LaserPlan 13.2: autofocus keeps changing the lens
+                // and the intrinsics, which hurts depth-from-motion.
+                config.setFocusMode(Config.FocusMode.FIXED);
                 session.configure(config);
             }
             session.resume();
@@ -147,7 +149,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 new int[]{3,5,8}[range.getSelectedItemPosition()],
                 new long[]{300,600,1000}[interval.getSelectedItemPosition()]*1_000_000L);
             java.util.Arrays.fill(poseTime,0);java.util.Arrays.fill(poseAndroidTime,0);
-            timingRejected=0;depthNotReady=0;trackingLost=0;depthLagMs=-1;lastRaw=0;lastAccepted=0;
+            timingRejected=0;depthNotReady=0;trackingLost=0;emptyDepth=0;smoothedHadData=0;depthLagMs=-1;lastRaw=0;lastAccepted=0;
             for(android.view.View v:new android.view.View[]{confidence,range,interval,start})v.setEnabled(false);
             pause.setText("Pause");pause.setEnabled(true);finish.setEnabled(true);
             recording=true;
@@ -165,6 +167,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 capture.depthNotReady=depthNotReady;
                 capture.trackingLost=trackingLost;
                 capture.depthLagMs=depthLagMs;
+                capture.emptyDepth=emptyDepth;
+                capture.smoothedHadData=smoothedHadData;
                 if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. "+diagnosis()
                         +" Resume and move slowly near a textured surface.");
                 File zip=capture.finish(new File(getFilesDir(),"LaserPlan-survey-"+System.currentTimeMillis()+".zip"));
@@ -236,7 +240,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                     if(saving||(!recording&&capture!=null))return;
                     status.setText((tracked?"Tracking":"Move slowly to recover tracking")
                             +(c==null?"":String.format(java.util.Locale.US," · %d frames · %,d points · depth lag %s · %d skips",
-                                accepted,points,depthLagMs<0?"–":depthLagMs+" ms",timingRejected)));
+                                accepted,points,depthLagMs<0?"–":depthLagMs+" ms",timingRejected+emptyDepth)));
                 });
             }
         }catch(Exception e){recording=false;runOnUiThread(()->{
@@ -259,8 +263,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private String diagnosis(){
         Capture c=capture;
         return String.format(java.util.Locale.US,
-            "Frames saved %d · timing skips %d · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
-            accepted,timingRejected,depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
+            "Frames saved %d · empty depth images %d (smoothed depth had data in %d) · timing skips %d · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
+            accepted,emptyDepth,smoothedHadData,timingRejected,depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
             c==null?0:c.pixelsKept,c==null?0:c.pixelsZero,c==null?0:c.pixelsFar,c==null?0:c.pixelsLowConfidence);
     }
 
@@ -301,6 +305,15 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             if(conf.getTimestamp()!=rawTime){timingRejected++;return;}
             int w=depth.getWidth(),h=depth.getHeight();
             if(w!=conf.getWidth()||h!=conf.getHeight())return;
+            // ARCore often hands back raw depth with no measured pixels. Skip it at once and keep trying
+            // on the next frames instead of saving an empty frame and waiting a whole interval.
+            if(Capture.nonZero16(depth)<Math.max(1,w*h/200)){
+                emptyDepth++;
+                try(Image smooth=frame.acquireDepthImage16Bits()){
+                    if(Capture.nonZero16(smooth)>0)smoothedHadData++;
+                }catch(Exception ignored){}
+                return;
+            }
             float[] pose=new float[16],k;
             String poseSource;
             int slot=findPose(rawTime);
