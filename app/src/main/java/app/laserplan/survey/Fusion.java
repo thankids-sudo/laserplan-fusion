@@ -122,6 +122,14 @@ final class Fusion {
             double rfx=k==null?fx*crop:k.getDouble("fx"),rfy=k==null?fy*crop:k.getDouble("fy");
             double rcx=k==null?(cx+.5-w*.5)*crop+rw*.5-.5:k.getDouble("cx");
             double rcy=k==null?(cy+.5-h*.5)*crop+rh*.5-.5:k.getDouble("cy");
+            // Newer captures store the photo's own pose; older ones share the depth pose.
+            double[] r=m;
+            JSONObject rgbPose=rgb.optJSONObject("pose");
+            JSONArray rgbMatrix=rgbPose==null?null:rgbPose.optJSONArray("matrixColumnMajor");
+            if(rgbMatrix!=null&&rgbMatrix.length()==16){
+                r=new double[16];
+                for(int i=0;i<16;i++)r[i]=rgbMatrix.getDouble(i);
+            }
             boolean contributed=false;
             for(int i=0;i<colors.length;i++){
                 double x=xyz[3*i]-m[12],y=xyz[3*i+1]-m[13],z=xyz[3*i+2]-m[14];
@@ -133,7 +141,13 @@ final class Fusion {
                 double measured=((depth[2*at]&255)|((depth[2*at+1]&255)<<8))*.001;
                 double tolerance=Math.max(.028,.018*c), error=Math.abs(c-measured);
                 if(quality<confidence||measured==0||error>=tolerance)continue;
-                int px=(int)Math.round(rfx*a/c+rcx),py=(int)Math.round(rfy*b/c+rcy);
+                double ra=a,rb=b,rc=c;
+                if(r!=m){
+                    double qx=xyz[3*i]-r[12],qy=xyz[3*i+1]-r[13],qz=xyz[3*i+2]-r[14];
+                    ra=r[0]*qx+r[1]*qy+r[2]*qz;rb=-(r[4]*qx+r[5]*qy+r[6]*qz);rc=-(r[8]*qx+r[9]*qy+r[10]*qz);
+                    if(rc<=.1)continue;
+                }
+                int px=(int)Math.round(rfx*ra/rc+rcx),py=(int)Math.round(rfy*rb/rc+rcy);
                 if(px<0||py<0||px>=rw||py>=rh)continue;
                 int color=pixels[py*rw+px];
                 float weight=(float)(quality/255.0*(1-error/tolerance)/(1+c*c*.25));

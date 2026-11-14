@@ -51,6 +51,20 @@ jobs:
           java -version
           gradle --version
 
+      # Optional: a fixed debug key (repository secret DEBUG_KEYSTORE_B64, base64 of a debug.keystore
+      # with the standard 'android' passwords) lets each new APK install over the previous one.
+      - name: Use the fixed debug key when the secret is set
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "${DEBUG_KEYSTORE_B64}" ]; then
+            mkdir -p ~/.android
+            printf '%s' "${DEBUG_KEYSTORE_B64}" | base64 -d > ~/.android/debug.keystore
+            echo "Using the fixed debug key from DEBUG_KEYSTORE_B64"
+          else
+            echo "::warning::DEBUG_KEYSTORE_B64 is not set. This APK gets a new debug key and will not install over the previous build."
+          fi
+
       - name: Build debug APK
         run: gradle --no-daemon --stacktrace assembleDebug
 

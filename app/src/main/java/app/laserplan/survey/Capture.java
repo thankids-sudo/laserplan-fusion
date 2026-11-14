@@ -22,7 +22,10 @@ final class Capture {
     final long interval;
     private final File dir;
     private final Map<Long, Sum> voxels = new LinkedHashMap<>();
-    int frames, rejected;
+    int frames, rejected, depthNotReady, trackingLost;
+    long depthLagMs=-1;
+    volatile int points;
+    volatile long pixelsKept, pixelsZero, pixelsFar, pixelsLowConfidence;
     private int photos;
     private boolean capReached;
 
@@ -69,10 +72,19 @@ final class Capture {
     }
 
     static float[] calibration(CameraIntrinsics camera, int w, int h) {
-        int[] size = camera.getImageDimensions();
+        return calibration(camera.getFocalLength(), camera.getPrincipalPoint(), camera.getImageDimensions(), w, h);
+    }
+
+    /** Scales intrinsics measured at size[] to an image of w×h (same aspect and orientation). */
+    static float[] calibration(float[] f, float[] p, int[] size, int w, int h) {
         float sx=(float)w/size[0], sy=(float)h/size[1];
-        float[] f=camera.getFocalLength(), p=camera.getPrincipalPoint();
         return new float[]{f[0]*sx,f[1]*sy,p[0]*sx,p[1]*sy};
+    }
+
+    private static JSONArray matrix(float[] values) throws Exception {
+        JSONArray out=new JSONArray();
+        for(float value:values) out.put(value);
+        return out;
     }
 
     private JSONObject intrinsics(float[] k, int w, int h) throws Exception {
@@ -81,14 +93,18 @@ final class Capture {
     }
 
     void writeFrame(long time, long depthTime, int w, int h, byte[] depth, byte[] conf,
-                    float[] k, float[] pose, byte[] jpeg, int rw, int rh, float[] rgbK) throws Exception {
+                    float[] k, float[] pose, String poseSource, byte[] jpeg, int rw, int rh, float[] rgbK,
+                    float[] rgbPose) throws Exception {
         int index=frames+1;
         String name=String.format(Locale.US,"%04d",index);
         String depthName="depth/"+name+".raw16le", confName="confidence/"+name+".raw8";
         int count=0;
+        long zero=0, far=0, low=0;
         for (int v=0;v<h;v++) for (int u=0;u<w;u++) {
             int i=v*w+u, mm=(depth[i*2]&255)|((depth[i*2+1]&255)<<8), c=conf[i]&255;
-            if (mm==0 || mm>range*1000 || c<confidence) continue;
+            if (mm==0) {zero++; continue;}
+            if (mm>range*1000) {far++; continue;}
+            if (c<confidence) {low++; continue;}
             double d=mm*.001, x=(u-k[2])*d/k[0], y=(k[3]-v)*d/k[1], z=-d;
             double wx=pose[0]*x+pose[4]*y+pose[8]*z+pose[12];
             double wy=pose[1]*x+pose[5]*y+pose[9]*z+pose[13];
@@ -101,6 +117,8 @@ final class Capture {
             if(sum==null) {sum=new Sum(); voxels.put(key,sum);}
             sum.x+=wx; sum.y+=wy; sum.z+=wz; sum.conf+=c/255.0; sum.n++;
         }
+        pixelsKept+=count; pixelsZero+=zero; pixelsFar+=far; pixelsLowConfidence+=low;
+        points=voxels.size();
         write(new File(dir,depthName),depth);
         write(new File(dir,confName),conf);
         JSONObject rgb=new JSONObject().put("status","unavailable");
@@ -109,18 +127,18 @@ final class Capture {
             write(new File(dir,photo),jpeg);
             rgb.put("status","saved").put("file",photo).put("width",rw).put("height",rh)
                .put("intrinsics",intrinsics(rgbK,rw,rh));
+            // The photo is from the live camera frame, which can be newer than the depth frame.
+            if(rgbPose!=null) rgb.put("cameraTimestampNs",time).put("pose",new JSONObject().put("matrixColumnMajor",matrix(rgbPose)));
             photos++;
         }
-        JSONArray matrix=new JSONArray();
-        for(float value:pose) matrix.put(value);
         JSONObject frame=new JSONObject().put("index",index).put("valid",true)
                 .put("cameraTimestampNs",time).put("depthTimestampNs",depthTime)
                 .put("depthToCameraDeltaNs",depthTime-time)
                 .put("depth",new JSONObject().put("file",depthName).put("width",w).put("height",h))
                 .put("confidence",new JSONObject().put("file",confName).put("width",w).put("height",h))
                 .put("intrinsics",new JSONObject().put("depth",intrinsics(k,w,h)))
-                .put("pose",new JSONObject().put("matrixColumnMajor",matrix))
-                .put("pixels",new JSONObject().put("accepted",count)).put("rgb",rgb);
+                .put("pose",new JSONObject().put("matrixColumnMajor",matrix(pose)).put("source",poseSource))
+                .put("pixels",new JSONObject().put("accepted",count).put("noDepth",zero).put("tooFar",far).put("lowConfidence",low)).put("rgb",rgb);
         write(new File(dir,"frames/"+name+".json"),frame.toString().getBytes(StandardCharsets.UTF_8));
         frames++;
     }
@@ -138,6 +156,10 @@ final class Capture {
                 .put("app",new JSONObject().put("name","LaserPlan Fusion"))
                 .put("frameCount",frames).put("validFrameCount",frames).put("pointCount",voxels.size())
                 .put("rejectedTimingAttempts",rejected).put("photoCount",photos)
+                .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady).put("trackingLostFrames",trackingLost)
+                      .put("lastDepthLagMs",depthLagMs).put("pixelsKept",pixelsKept).put("pixelsNoDepth",pixelsZero)
+                      .put("pixelsTooFar",pixelsFar).put("pixelsLowConfidence",pixelsLowConfidence)
+                      .put("poseMethod","depth uses the pose of the camera frame matching the depth timestamp (8 ms), else the live pose within 50 ms"))
                 .put("voxelCapReached",capReached)
                 .put("coordinates",new JSONObject().put("world","ARCore world, metres, +Y up")
                       .put("camera","+X right, +Y up, -Z forward"))

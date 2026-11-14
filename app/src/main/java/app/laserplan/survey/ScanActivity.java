@@ -33,7 +33,15 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private volatile boolean recording,busy,saving;
     private volatile Capture capture;
     private long lastAccepted,lastRaw,lastStatus;
-    private volatile int accepted,timingRejected;
+    private volatile int accepted,timingRejected,depthNotReady,trackingLost;
+    private volatile long depthLagMs=-1;
+    // Recent camera poses by frame timestamp. ARCore's raw depth image usually belongs to an earlier
+    // camera frame, so its points must use that frame's pose, not the live one (same approach as LaserPlan 13.2).
+    private static final int POSES=120;
+    private static final long POSE_MATCH_NS=8_000_000L;
+    private final long[] poseTime=new long[POSES],poseAndroidTime=new long[POSES];
+    private final float[][] poseMatrix=new float[POSES][16],poseIntrinsics=new float[POSES][6];
+    private int poseNext;
 
     @Override public void onCreate(Bundle state){
         super.onCreate(state);
@@ -138,6 +146,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             capture=new Capture(getCacheDir(),new int[]{96,128,192}[confidence.getSelectedItemPosition()],
                 new int[]{3,5,8}[range.getSelectedItemPosition()],
                 new long[]{300,600,1000}[interval.getSelectedItemPosition()]*1_000_000L);
+            java.util.Arrays.fill(poseTime,0);java.util.Arrays.fill(poseAndroidTime,0);
+            timingRejected=0;depthNotReady=0;trackingLost=0;depthLagMs=-1;lastRaw=0;lastAccepted=0;
             for(android.view.View v:new android.view.View[]{confidence,range,interval,start})v.setEnabled(false);
             pause.setText("Pause");pause.setEnabled(true);finish.setEnabled(true);
             recording=true;
@@ -151,8 +161,12 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
         // Queue behind GL acquisition and any outstanding frame write.
         surface.queueEvent(()->writer.execute(()->{
             try{
-                if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. Resume and move slowly near a textured surface.");
                 capture.rejected=timingRejected;
+                capture.depthNotReady=depthNotReady;
+                capture.trackingLost=trackingLost;
+                capture.depthLagMs=depthLagMs;
+                if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. "+diagnosis()
+                        +" Resume and move slowly near a textured surface.");
                 File zip=capture.finish(new File(getFilesDir(),"LaserPlan-survey-"+System.currentTimeMillis()+".zip"));
                 runOnUiThread(()->{
                     if(isDestroyed())return;
@@ -208,15 +222,21 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             frame.transformCoordinates2d(Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,quad,
                     Coordinates2d.TEXTURE_NORMALIZED,uv);
             drawCamera();
-            if(recording&&!busy)acquire(frame);
+            boolean tracked=frame.getCamera().getTrackingState()==TrackingState.TRACKING;
+            if(recording){
+                if(tracked)remember(frame);else trackingLost++;
+                if(!busy)acquire(frame);
+            }
             long now=android.os.SystemClock.uptimeMillis();
             if(!saving&&now-lastStatus>350&&(recording||capture==null)){
                 lastStatus=now;
-                boolean tracked=frame.getCamera().getTrackingState()==TrackingState.TRACKING;
+                Capture c=capture;
+                int points=c==null?0:c.points;
                 runOnUiThread(()->{
                     if(saving||(!recording&&capture!=null))return;
                     status.setText((tracked?"Tracking":"Move slowly to recover tracking")
-                            +" · "+accepted+" captured · "+timingRejected+" timing skips");
+                            +(c==null?"":String.format(java.util.Locale.US," · %d frames · %,d points · depth lag %s · %d skips",
+                                accepted,points,depthLagMs<0?"–":depthLagMs+" ms",timingRejected)));
                 });
             }
         }catch(Exception e){recording=false;runOnUiThread(()->{
@@ -236,6 +256,38 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
         GLES20.glEnableVertexAttribArray(p);GLES20.glEnableVertexAttribArray(t);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
     }
+    private String diagnosis(){
+        Capture c=capture;
+        return String.format(java.util.Locale.US,
+            "Frames saved %d · timing skips %d · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
+            accepted,timingRejected,depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
+            c==null?0:c.pixelsKept,c==null?0:c.pixelsZero,c==null?0:c.pixelsFar,c==null?0:c.pixelsLowConfidence);
+    }
+
+    /** GL thread: remembers this frame's pose and texture intrinsics for depth that arrives later. */
+    private void remember(Frame frame){
+        Camera camera=frame.getCamera();
+        int slot=poseNext;poseNext=(poseNext+1)%POSES;
+        poseTime[slot]=frame.getTimestamp();
+        poseAndroidTime[slot]=frame.getAndroidCameraTimestamp();
+        camera.getPose().toMatrix(poseMatrix[slot],0);
+        CameraIntrinsics t=camera.getTextureIntrinsics();
+        float[] f=t.getFocalLength(),p=t.getPrincipalPoint();int[] d=t.getImageDimensions();
+        float[] k=poseIntrinsics[slot];
+        k[0]=f[0];k[1]=f[1];k[2]=p[0];k[3]=p[1];k[4]=d[0];k[5]=d[1];
+    }
+
+    /** Slot of the remembered frame whose timestamp matches [time] within 8 ms, or -1. */
+    private int findPose(long time){
+        int best=-1;long bestError=POSE_MATCH_NS;
+        for(int i=0;i<POSES;i++){
+            if(poseTime[i]==0)continue;
+            long error=Math.min(Math.abs(poseTime[i]-time),Math.abs(poseAndroidTime[i]-time));
+            if(error<=bestError){bestError=error;best=i;}
+        }
+        return best;
+    }
+
     private void acquire(Frame frame) throws Exception{
         Capture target=capture;
         long time=frame.getTimestamp();
@@ -245,30 +297,40 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             long rawTime=depth.getTimestamp();
             if(rawTime==lastRaw)return;
             lastRaw=rawTime;
-            if(Math.abs(time-rawTime)>Capture.MAX_DELTA||conf.getTimestamp()!=rawTime){
-                timingRejected++;return;
-            }
+            depthLagMs=Math.abs(time-rawTime)/1_000_000L;
+            if(conf.getTimestamp()!=rawTime){timingRejected++;return;}
             int w=depth.getWidth(),h=depth.getHeight();
             if(w!=conf.getWidth()||h!=conf.getHeight())return;
+            float[] pose=new float[16],k;
+            String poseSource;
+            int slot=findPose(rawTime);
+            if(slot>=0){
+                System.arraycopy(poseMatrix[slot],0,pose,0,16);
+                float[] m=poseIntrinsics[slot];
+                k=Capture.calibration(new float[]{m[0],m[1]},new float[]{m[2],m[3]},new int[]{(int)m[4],(int)m[5]},w,h);
+                poseSource="matched-frame";
+            }else if(Math.abs(time-rawTime)<=Capture.MAX_DELTA){
+                camera.getPose().toMatrix(pose,0);
+                k=Capture.calibration(camera.getTextureIntrinsics(),w,h);
+                poseSource="current-frame";
+            }else{timingRejected++;return;}
             byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
-            float[] k=Capture.calibration(camera.getTextureIntrinsics(),w,h),pose=new float[16];
-            camera.getPose().toMatrix(pose,0);
-            byte[] color=null;int rw=0,rh=0;float[] rgbK=null;
+            byte[] color=null;int rw=0,rh=0;float[] rgbK=null,rgbPose=null;
             if(accepted%3==0){
                 try(Image rgb=frame.acquireCameraImage()){
-                    if(Math.abs(rgb.getTimestamp()-time)<=Capture.MAX_DELTA){
-                        rw=rgb.getWidth();rh=rgb.getHeight();
-                        rgbK=Capture.calibration(camera.getImageIntrinsics(),rw,rh);
-                        color=Capture.jpeg(rgb);
-                    }
+                    rw=rgb.getWidth();rh=rgb.getHeight();
+                    rgbK=Capture.calibration(camera.getImageIntrinsics(),rw,rh);
+                    color=Capture.jpeg(rgb);
+                    rgbPose=new float[16];camera.getPose().toMatrix(rgbPose,0);
                 }catch(NotYetAvailableException ignored){}
             }
-            final byte[] jpeg=color; final int photoW=rw,photoH=rh; final float[] photoK=rgbK;
+            final byte[] jpeg=color; final int photoW=rw,photoH=rh; final float[] photoK=rgbK,photoPose=rgbPose;
+            final String source=poseSource;
             lastAccepted=time;
             busy=true;
             writer.execute(()->{
                 try{
-                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,jpeg,photoW,photoH,photoK);
+                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,source,jpeg,photoW,photoH,photoK,photoPose);
                     accepted=target.frames;
                     if(accepted>=Capture.MAX_FRAMES){
                         recording=false;
@@ -284,6 +346,6 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                     });
                 }finally{busy=false;}
             });
-        }catch(NotYetAvailableException ignored){}
+        }catch(NotYetAvailableException ignored){depthNotReady++;}
     }
 }
