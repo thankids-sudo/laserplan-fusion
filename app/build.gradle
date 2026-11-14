@@ -8,8 +8,8 @@ android {
         applicationId 'app.laserplan.fusion'
         minSdk 26
         targetSdk 34
-        versionCode 3
-        versionName '0.4'
+        versionCode 4
+        versionName '0.5'
     }
     // CI sets FUSION_DEBUG_KEYSTORE (from the DEBUG_KEYSTORE_B64 secret) so every debug APK has the
     // same signature and installs over the previous one. Local builds keep the normal debug key.

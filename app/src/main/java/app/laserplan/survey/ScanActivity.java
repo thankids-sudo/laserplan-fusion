@@ -34,11 +34,15 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private volatile Capture capture;
     private long lastAccepted,lastRaw,lastStatus;
     private volatile int accepted,timingRejected,depthNotReady,trackingLost,emptyDepth,smoothedHadData;
+    private volatile int confMismatch,poseMatched,poseApprox,poseTooOld;
+    private volatile long bestMatchErrorUs=-1;
+    private static final long APPROX_POSE_NS=100_000_000L;
     private volatile long depthLagMs=-1;
     // Recent camera poses by frame timestamp. ARCore's raw depth image usually belongs to an earlier
     // camera frame, so its points must use that frame's pose, not the live one (same approach as LaserPlan 13.2).
     private static final int POSES=120;
-    private static final long POSE_MATCH_NS=8_000_000L;
+    // One camera-frame interval at 30 fps: the depth timestamp names one remembered frame.
+    private static final long POSE_MATCH_NS=34_000_000L;
     private final long[] poseTime=new long[POSES],poseAndroidTime=new long[POSES];
     private final float[][] poseMatrix=new float[POSES][16],poseIntrinsics=new float[POSES][6];
     private int poseNext;
@@ -149,7 +153,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 new int[]{3,5,8}[range.getSelectedItemPosition()],
                 new long[]{300,600,1000}[interval.getSelectedItemPosition()]*1_000_000L);
             java.util.Arrays.fill(poseTime,0);java.util.Arrays.fill(poseAndroidTime,0);
-            timingRejected=0;depthNotReady=0;trackingLost=0;emptyDepth=0;smoothedHadData=0;depthLagMs=-1;lastRaw=0;lastAccepted=0;
+            timingRejected=0;depthNotReady=0;trackingLost=0;emptyDepth=0;smoothedHadData=0;
+            confMismatch=0;poseMatched=0;poseApprox=0;poseTooOld=0;bestMatchErrorUs=-1;depthLagMs=-1;lastRaw=0;lastAccepted=0;
             for(android.view.View v:new android.view.View[]{confidence,range,interval,start})v.setEnabled(false);
             pause.setText("Pause");pause.setEnabled(true);finish.setEnabled(true);
             recording=true;
@@ -169,6 +174,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 capture.depthLagMs=depthLagMs;
                 capture.emptyDepth=emptyDepth;
                 capture.smoothedHadData=smoothedHadData;
+                capture.confMismatch=confMismatch;capture.poseMatched=poseMatched;
+                capture.poseApprox=poseApprox;capture.poseTooOld=poseTooOld;capture.bestMatchErrorUs=bestMatchErrorUs;
                 if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. "+diagnosis()
                         +" Resume and move slowly near a textured surface.");
                 File zip=capture.finish(new File(getFilesDir(),"LaserPlan-survey-"+System.currentTimeMillis()+".zip"));
@@ -263,8 +270,10 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private String diagnosis(){
         Capture c=capture;
         return String.format(java.util.Locale.US,
-            "Frames saved %d · empty depth images %d (smoothed depth had data in %d) · timing skips %d · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
-            accepted,emptyDepth,smoothedHadData,timingRejected,depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
+            "Frames saved %d (pose matched %d, approximate %d) · empty depth %d (smoothed had data %d) · confidence mismatch %d · depth too old %d · closest pose %s · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
+            accepted,poseMatched,poseApprox,emptyDepth,smoothedHadData,confMismatch,poseTooOld,
+            bestMatchErrorUs<0?"none":String.format(java.util.Locale.US,"%.1f ms",bestMatchErrorUs/1000.0),
+            depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
             c==null?0:c.pixelsKept,c==null?0:c.pixelsZero,c==null?0:c.pixelsFar,c==null?0:c.pixelsLowConfidence);
     }
 
@@ -283,13 +292,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
 
     /** Slot of the remembered frame whose timestamp matches [time] within 8 ms, or -1. */
     private int findPose(long time){
-        int best=-1;long bestError=POSE_MATCH_NS;
+        int best=-1;long bestError=Long.MAX_VALUE;
         for(int i=0;i<POSES;i++){
             if(poseTime[i]==0)continue;
             long error=Math.min(Math.abs(poseTime[i]-time),Math.abs(poseAndroidTime[i]-time));
-            if(error<=bestError){bestError=error;best=i;}
+            if(error<bestError){bestError=error;best=i;}
         }
-        return best;
+        if(best>=0)bestMatchErrorUs=bestError/1000L;
+        return bestError<=POSE_MATCH_NS?best:-1;
     }
 
     private void acquire(Frame frame) throws Exception{
@@ -302,7 +312,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             if(rawTime==lastRaw)return;
             lastRaw=rawTime;
             depthLagMs=Math.abs(time-rawTime)/1_000_000L;
-            if(conf.getTimestamp()!=rawTime){timingRejected++;return;}
+            if(conf.getTimestamp()!=rawTime){timingRejected++;confMismatch++;return;}
             int w=depth.getWidth(),h=depth.getHeight();
             if(w!=conf.getWidth()||h!=conf.getHeight())return;
             // ARCore often hands back raw depth with no measured pixels. Skip it at once and keep trying
@@ -322,11 +332,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 float[] m=poseIntrinsics[slot];
                 k=Capture.calibration(new float[]{m[0],m[1]},new float[]{m[2],m[3]},new int[]{(int)m[4],(int)m[5]},w,h);
                 poseSource="matched-frame";
-            }else if(Math.abs(time-rawTime)<=Capture.MAX_DELTA){
+                poseMatched++;
+            }else if(Math.abs(time-rawTime)<=APPROX_POSE_NS){
+                // Last resort: the live pose. Off by the camera movement during the lag (about 2 cm at a slow walk).
                 camera.getPose().toMatrix(pose,0);
                 k=Capture.calibration(camera.getTextureIntrinsics(),w,h);
-                poseSource="current-frame";
-            }else{timingRejected++;return;}
+                poseSource=Math.abs(time-rawTime)<=Capture.MAX_DELTA?"current-frame":"approximate-live-pose";
+                poseApprox++;
+            }else{timingRejected++;poseTooOld++;return;}
             byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
             byte[] color=null;int rw=0,rh=0;float[] rgbK=null,rgbPose=null;
             if(accepted%3==0){

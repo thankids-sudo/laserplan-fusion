@@ -23,6 +23,8 @@ final class Capture {
     private final File dir;
     private final Map<Long, Sum> voxels = new LinkedHashMap<>();
     int frames, rejected, depthNotReady, trackingLost, emptyDepth, smoothedHadData;
+    int confMismatch, poseMatched, poseApprox, poseTooOld;
+    long bestMatchErrorUs=-1;
     long depthLagMs=-1;
     volatile int points;
     volatile long pixelsKept, pixelsZero, pixelsFar, pixelsLowConfidence;
@@ -169,10 +171,13 @@ final class Capture {
                 .put("frameCount",frames).put("validFrameCount",frames).put("pointCount",voxels.size())
                 .put("rejectedTimingAttempts",rejected).put("photoCount",photos)
                 .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady)
-                      .put("emptyRawDepthImagesSkipped",emptyDepth).put("smoothedDepthHadDataWhenRawEmpty",smoothedHadData).put("trackingLostFrames",trackingLost)
+                      .put("emptyRawDepthImagesSkipped",emptyDepth)
+                      .put("confidenceTimestampMismatch",confMismatch).put("poseMatchedFrames",poseMatched)
+                      .put("approximatePoseFrames",poseApprox).put("depthTooOld",poseTooOld)
+                      .put("lastClosestPoseErrorUs",bestMatchErrorUs).put("smoothedDepthHadDataWhenRawEmpty",smoothedHadData).put("trackingLostFrames",trackingLost)
                       .put("lastDepthLagMs",depthLagMs).put("pixelsKept",pixelsKept).put("pixelsNoDepth",pixelsZero)
                       .put("pixelsTooFar",pixelsFar).put("pixelsLowConfidence",pixelsLowConfidence)
-                      .put("poseMethod","depth uses the pose of the camera frame matching the depth timestamp (8 ms), else the live pose within 50 ms"))
+                      .put("poseMethod","depth uses the pose of the camera frame matching the depth timestamp (34 ms); otherwise the live pose when depth is at most 100 ms old, marked approximate in frames/NNNN.json pose.source"))
                 .put("voxelCapReached",capReached)
                 .put("coordinates",new JSONObject().put("world","ARCore world, metres, +Y up")
                       .put("camera","+X right, +Y up, -Z forward"))
