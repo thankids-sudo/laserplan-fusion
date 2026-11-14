@@ -379,8 +379,14 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             }else{timingRejected++;poseTooOld++;log(head+" "+nonZero+" "+match+" too-old");return;}
             log(head+" "+nonZero+" "+match+" saved:"+poseSource);
             byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
+            // ARCore's smoothed depth for the same frame (an estimate, dense on plain walls and floors).
+            byte[] smooth=null;
+            try(Image s=frame.acquireDepthImage16Bits()){
+                if(s.getWidth()==w&&s.getHeight()==h&&Math.abs(s.getTimestamp()-rawTime)<=1_000_000L)smooth=Capture.pack(s,2);
+            }catch(Exception ignored){}
+            final byte[] smoothDepth=smooth;
             byte[] color=null;int rw=0,rh=0;float[] rgbK=null,rgbPose=null;
-            if(accepted%3==0){
+            {  // a photo with every depth frame: more views to choose texture from
                 try(Image rgb=frame.acquireCameraImage()){
                     rw=rgb.getWidth();rh=rgb.getHeight();
                     rgbK=Capture.calibration(camera.getImageIntrinsics(),rw,rh);
@@ -394,7 +400,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             busy=true;
             writer.execute(()->{
                 try{
-                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,source,jpeg,photoW,photoH,photoK,photoPose);
+                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,source,jpeg,photoW,photoH,photoK,photoPose,smoothDepth);
                     accepted=target.frames;
                     if(accepted>=Capture.MAX_FRAMES){
                         recording=false;

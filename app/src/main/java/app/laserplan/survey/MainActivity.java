@@ -16,7 +16,7 @@ public final class MainActivity extends Activity {
     private ScanView view;
     private TextView status,legend,surfaceLabel;
     private File selected;
-    private int generation,mode,smoothing=2,fill=1;
+    private int generation,mode,smoothing=2,fill=3;
     private Fusion current;
     private DepthModel depthModel;
     private boolean aiEnabled;
@@ -105,7 +105,7 @@ public final class MainActivity extends Activity {
         boolean approx=current!=null&&current.approximateAlignment;
         legend.setText(new String[]{"Measured points, original positions · metres",
                 "Points coloured from visible photos"+(approx?" · APPROXIMATE alignment (older ZIP without photo calibration)":""),
-                "Surface from measured depth · edges and gaps kept open · amber in Coverage = estimated",
+                "Surface from measured depth, textured with the best photo per triangle · edges and gaps kept open",
                 "Mint: photo sampled · Amber: estimated (fill or colour) · Violet: AI estimate · Grey: no photo"}[mode]
                 +(mode>=ScanView.SURFACE&&aiEnabled?"\n"+aiReport:""));
     }
@@ -135,9 +135,16 @@ public final class MainActivity extends Activity {
                 extra=ai.frames;
             }
             SurfaceBuilder.Mesh mesh=data.surface(s,f,extra);
+            runOnUiThread(()->{if(!isDestroyed()&&request==generation)surfaceLabel.setText("Texturing surface from photos…");});
+            long t0=System.nanoTime();
+            Fusion.Textured texture=data.texture(mesh);
+            long textureMs=(System.nanoTime()-t0)/1_000_000L;
             runOnUiThread(()->{
-                if(isDestroyed()||request!=generation||data!=current)return;
-                view.setMesh(mesh);labelSurface(mesh);updateLegend();
+                if(isDestroyed()||request!=generation||data!=current){if(texture!=null&&texture.atlas!=null)texture.atlas.recycle();return;}
+                view.setMesh(mesh,texture);labelSurface(mesh);updateLegend();
+                if(texture!=null)surfaceLabel.append(String.format(java.util.Locale.US,
+                    "\nPhoto texture: %.0f%% of triangles from %d photos · %d ms",
+                    100f*texture.map.textured/Math.max(1,mesh.triangles),texture.map.used.length,textureMs));
             });
         });
     }

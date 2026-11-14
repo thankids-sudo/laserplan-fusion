@@ -8,8 +8,8 @@ android {
         applicationId 'app.laserplan.fusion'
         minSdk 26
         targetSdk 34
-        versionCode 7
-        versionName '0.8'
+        versionCode 8
+        versionName '0.9'
     }
     // standard: no AI model (small APK). ai: adds MiDaS v2.1 Small (MIT) for the optional AI depth fill;
     // CI downloads the model from the official MiDaS release and checks its SHA-256 (never committed).
