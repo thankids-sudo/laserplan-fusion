@@ -20,6 +20,9 @@ final class Fusion {
     /** True when any photo had to use the approximate (crop) alignment of older ZIPs. */
     boolean approximateAlignment;
     int minConfidence=128;
+    /** Calibrated photos (own intrinsics and pose) kept for the optional AI depth fill. */
+    final List<Photo> photos=new ArrayList<>();
+    static final class Photo{byte[] jpeg;int width,height;double fx,fy,cx,cy;double[] pose;}
     float maxRange=5;
     float span=.1f;
     private final HashMap<Long,Integer> cells=new HashMap<>();
@@ -180,6 +183,11 @@ final class Fusion {
         if(r==null)return false;
         Bitmap image=BitmapFactory.decodeByteArray(photo,0,photo.length);
         if(image==null)return false;
+        if(k!=null&&(rp!=null||rgb.has("poseMatrixColumnMajor"))){
+            Photo kept=new Photo();
+            kept.jpeg=photo;kept.width=rw;kept.height=rh;kept.fx=rfx;kept.fy=rfy;kept.cx=rcx;kept.cy=rcy;kept.pose=r;
+            photos.add(kept);
+        }
         try{
             int[] pixels=new int[rw*rh];
             image.getPixels(pixels,0,rw,0,0,rw,rh);
@@ -231,8 +239,91 @@ final class Fusion {
         return previewColors[best];
     }
 
-    SurfaceBuilder.Mesh surface(int smoothing,int fill){
-        return SurfaceBuilder.build(depthFrames,this::colorNear,smoothing,fill,minConfidence,maxRange,300_000);
+    SurfaceBuilder.Mesh surface(int smoothing,int fill){return surface(smoothing,fill,null);}
+
+    /** Surface from measured depth frames; optional AI frames come last, so they only add what is still open. */
+    SurfaceBuilder.Mesh surface(int smoothing,int fill,List<SurfaceBuilder.Frame> ai){
+        List<SurfaceBuilder.Frame> frames=depthFrames;
+        if(ai!=null&&!ai.isEmpty()){frames=new ArrayList<>(depthFrames);frames.addAll(ai);}
+        return SurfaceBuilder.build(frames,this::colorNear,smoothing,fill,minConfidence,maxRange,300_000);
+    }
+
+    /** Result of running the AI depth fill over all calibrated photos. */
+    static final class AiResult{
+        final List<SurfaceBuilder.Frame> frames=new ArrayList<>();
+        int photos,fitted,cells;long inferenceMs,totalMs;String model;
+    }
+
+    static final int AI_GW=80,AI_GH=60;   // photo cell grid (8 px cells on a 640×480 photo)
+
+    /**
+     * Runs the depth model on each calibrated photo and turns enclosed, same-surface holes into extra
+     * surface frames (GuidedFill). Measured cells are included so the estimate joins the measured surface.
+     */
+    AiResult aiFrames(DepthModel model){
+        AiResult result=new AiResult();
+        result.model=model.label();
+        long start=System.nanoTime();
+        int gw=AI_GW,gh=AI_GH,side=model.side();
+        for(Photo p:photos){
+            Bitmap image=BitmapFactory.decodeByteArray(p.jpeg,0,p.jpeg.length);
+            if(image==null)continue;
+            try{
+                result.photos++;
+                long t=System.nanoTime();
+                float[] out;
+                try{out=model.predict(image);}catch(Exception e){continue;}
+                result.inferenceMs+=(System.nanoTime()-t)/1_000_000L;
+                double cellW=(double)p.width/gw,cellH=(double)p.height/gh;
+                // Measured depth per cell: nearest visible cloud point (the cloud is the measured data).
+                float[] depth=new float[gw*gh];
+                double[] r=p.pose;
+                for(int i=0;i<colors.length;i++){
+                    double x=xyz[3*i]-r[12],y=xyz[3*i+1]-r[13],z=xyz[3*i+2]-r[14];
+                    double a=r[0]*x+r[1]*y+r[2]*z,b=r[4]*x+r[5]*y+r[6]*z,c=-(r[8]*x+r[9]*y+r[10]*z);
+                    if(c<=.1)continue;
+                    double u=p.fx*a/c+p.cx,v=p.cy-p.fy*b/c;
+                    if(u<0||v<0||u>=p.width||v>=p.height)continue;
+                    int g=(int)(v/cellH)*gw+(int)(u/cellW);
+                    if(depth[g]==0||c<depth[g])depth[g]=(float)c;
+                }
+                // Model value at each cell centre (bilinear on the side×side output).
+                float[] cell=new float[gw*gh];
+                for(int j=0;j<gh;j++)for(int i=0;i<gw;i++){
+                    float sx=(i+.5f)*side/gw-.5f,sy=(j+.5f)*side/gh-.5f;
+                    int x0=Math.max(0,Math.min(side-2,(int)Math.floor(sx))),y0=Math.max(0,Math.min(side-2,(int)Math.floor(sy)));
+                    float fx=Math.max(0,Math.min(1,sx-x0)),fy=Math.max(0,Math.min(1,sy-y0));
+                    cell[j*gw+i]=(1-fy)*((1-fx)*out[y0*side+x0]+fx*out[y0*side+x0+1])+fy*((1-fx)*out[(y0+1)*side+x0]+fx*out[(y0+1)*side+x0+1]);
+                }
+                boolean[] filled=new boolean[gw*gh];
+                float[] z=GuidedFill.fill(depth,cell,gw,gh,maxRange,filled);
+                if(z==null)continue;
+                result.fitted++;
+                int count=0;for(boolean f:filled)if(f)count++;
+                if(count==0)continue;
+                result.cells+=count;
+                // Surface frame at twice the cell grid, so SurfaceBuilder's 2-pixel stride lands on one sample per cell.
+                SurfaceBuilder.Frame frame=new SurfaceBuilder.Frame();
+                int w=2*gw,h=2*gh;
+                frame.width=w;frame.height=h;
+                frame.depthMm=new short[w*h];frame.modelMask=new byte[w*h];frame.pixelColor=new int[w*h];
+                for(int y=0;y<h;y++)for(int x=0;x<w;x++){
+                    int g=(y/2)*gw+x/2,at=y*w+x;
+                    frame.depthMm[at]=(short)Math.min(65535,Math.round(z[g]*1000));
+                    if(filled[g]){
+                        frame.modelMask[at]=1;
+                        int px=(int)Math.min(p.width-1,(x/2+.5)*cellW),py=(int)Math.min(p.height-1,(y/2+.5)*cellH);
+                        frame.pixelColor[at]=image.getPixel(px,py);
+                    }
+                }
+                double scale=(double)w/p.width;
+                frame.fx=p.fx*scale;frame.fy=p.fy*scale;frame.cx=(p.cx+.5)*scale-.5;frame.cy=(p.cy+.5)*scale-.5;
+                frame.pose=p.pose;frame.measured=0;
+                result.frames.add(frame);
+            }finally{image.recycle();}
+        }
+        result.totalMs=(System.nanoTime()-start)/1_000_000L;
+        return result;
     }
 
     private void preparePreview(){

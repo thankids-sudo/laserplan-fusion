@@ -18,7 +18,7 @@ import java.util.List;
  * Pure Java (no Android types) so it runs in JVM unit tests and offline checks.
  */
 final class SurfaceBuilder {
-    static final int UNCOVERED = 0, PHOTO = 1, ESTIMATED = 2;
+    static final int UNCOVERED = 0, PHOTO = 1, ESTIMATED = 2, MODEL = 3;
     static final int NEUTRAL = 0xff90a5b6;
     static final int STRIDE = 2;
     static final float OWNER_CELL_M = 0.04f;
@@ -33,13 +33,15 @@ final class SurfaceBuilder {
         double[] pose;        // world_from_camera, column-major 4x4
         double fx, fy, cx, cy;
         int measured;         // valid pixels, used to order frames
+        byte[] modelMask;     // optional: non-zero where depth is an AI estimate (GuidedFill)
+        int[] pixelColor;     // optional: photo colour per pixel for AI-estimated cells
     }
 
     static final class Mesh {
         float[] xyz = new float[0];
         int[] color = new int[0];
         byte[] source = new byte[0];
-        int triangles, photo, estimated, uncovered, framesUsed;
+        int triangles, photo, estimated, uncovered, model, framesUsed;
     }
 
     private SurfaceBuilder() {}
@@ -147,6 +149,11 @@ final class SurfaceBuilder {
                 if (argb == 0) { cellColor[at] = NEUTRAL; cellSource[at] = UNCOVERED; }
                 else { cellColor[at] = argb; cellSource[at] = (byte) src[0]; }
                 if (estimated[at]) cellSource[at] = ESTIMATED;
+                int pixel = (j * STRIDE) * f.width + i * STRIDE;
+                if (f.modelMask != null && f.modelMask[pixel] != 0) {
+                    cellSource[at] = MODEL;
+                    if (f.pixelColor != null) cellColor[at] = f.pixelColor[pixel];
+                }
             }
             boolean used = false;
             for (int j = 0; j + 1 < gh; j++) for (int i = 0; i + 1 < gw; i++) {
@@ -171,15 +178,17 @@ final class SurfaceBuilder {
         long key = cellKey(cx) << 42 | cellKey(cy) << 21 | cellKey(cz);
         Integer first = owner.putIfAbsent(key, frame);
         if (first != null && first != frame) return false;   // another frame already drew this patch
-        int photo = 0, estimated = 0;
+        int photo = 0, estimated = 0, model = 0;
         for (int v : new int[]{a, b, c}) {
             xyz.add(world[3 * v]); xyz.add(world[3 * v + 1]); xyz.add(world[3 * v + 2]);
             color.add(cellColor[v]); source.add(cellSource[v]);
             if (cellSource[v] == PHOTO) photo++;
             if (cellSource[v] == ESTIMATED) estimated++;
+            if (cellSource[v] == MODEL) model++;
         }
         mesh.triangles++;
-        if (estimated > 0) mesh.estimated++;
+        if (model > 0) mesh.model++;
+        else if (estimated > 0) mesh.estimated++;
         else if (photo == 3) mesh.photo++;
         else mesh.uncovered++;
         return true;

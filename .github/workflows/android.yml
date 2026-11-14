@@ -68,32 +68,44 @@ jobs:
             echo "::warning::DEBUG_KEYSTORE_B64 is not set. This APK gets a new debug key and will not install over the previous build."
           fi
 
-      - name: Build debug APK
-        run: gradle --no-daemon --stacktrace testDebugUnitTest assembleDebug
-
-      - name: Verify APK exists and its signature
+      - name: Fetch MiDaS v2.1 Small (MIT, Intel ISL) for the ai build
         run: |
           set -euo pipefail
-          APK=app/build/outputs/apk/debug/app-debug.apk
-          test -s "$APK" || { echo "::error::Debug APK was not produced at $APK"; exit 1; }
+          mkdir -p app/src/ai/assets
+          curl -sSfL --retry 3 -o app/src/ai/assets/midas_v21_small_256.tflite \
+            https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite
+          echo "93d871071edff1218973ce25ee27ce95ccd20450c70a55e1b89efa3f5a772cdd  app/src/ai/assets/midas_v21_small_256.tflite" | sha256sum -c -
+
+      - name: Build debug APKs (standard and ai)
+        run: gradle --no-daemon --stacktrace testStandardDebugUnitTest assembleStandardDebug assembleAiDebug
+
+      - name: Verify APKs exist and their signatures
+        run: |
+          set -euo pipefail
           SIGNER="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}/apksigner"
-          "$SIGNER" verify --verbose --print-certs "$APK" | tee apksigner.txt
-          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" apksigner.txt \
-            || { echo "::error::APK signature scheme v2 verification failed"; exit 1; }
           AAPT="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}/aapt2"
-          "$AAPT" dump badging "$APK" | head -3
-          {
-            echo "### LaserPlan Fusion debug APK"
-            echo '```'
-            ls -l "$APK"
-            sha256sum "$APK"
-            grep -E "Signer #1 certificate (DN|SHA-256)" apksigner.txt || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### LaserPlan Fusion debug APKs" >> "$GITHUB_STEP_SUMMARY"
+          for APK in app/build/outputs/apk/standard/debug/app-standard-debug.apk app/build/outputs/apk/ai/debug/app-ai-debug.apk; do
+            test -s "$APK" || { echo "::error::APK was not produced at $APK"; exit 1; }
+            "$SIGNER" verify --verbose --print-certs "$APK" | tee apksigner.txt
+            grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" apksigner.txt \
+              || { echo "::error::APK signature scheme v2 verification failed for $APK"; exit 1; }
+            "$AAPT" dump badging "$APK" | head -1
+            { echo '```'; ls -l "$APK"; sha256sum "$APK"; grep -E "Signer #1 certificate SHA-256" apksigner.txt || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+          unzip -l app/build/outputs/apk/ai/debug/app-ai-debug.apk | grep -q "assets/midas_v21_small_256.tflite" \
+            || { echo "::error::ai APK is missing the MiDaS model"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
           name: LaserPlanFusion-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/standard/debug/app-standard-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LaserPlanFusion-ai-debug
+          path: app/build/outputs/apk/ai/debug/app-ai-debug.apk
           if-no-files-found: error
           retention-days: 30

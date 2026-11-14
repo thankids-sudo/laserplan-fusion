@@ -24,3 +24,7 @@ LaserPlan-survey-*
 keystore.properties
 signing.properties
 google-services.json
+
+# AI model files are fetched by CI (official release + SHA-256), never committed
+*.tflite
+*.onnx

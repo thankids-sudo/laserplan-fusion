@@ -62,7 +62,8 @@ final class ScanView extends GLSurfaceView implements GLSurfaceView.Renderer {
         FloatBuffer out=ByteBuffer.allocateDirect(meshCount*24).order(ByteOrder.nativeOrder()).asFloatBuffer();
         for(int v=0;v<meshCount;v++){
             int source=mesh.source[v];
-            int color=mode==COVERAGE?(source==SurfaceBuilder.PHOTO?0xff72d9b2:source==SurfaceBuilder.ESTIMATED?0xffffb05e:0xff778898)
+            int color=mode==COVERAGE?(source==SurfaceBuilder.PHOTO?0xff72d9b2:source==SurfaceBuilder.ESTIMATED?0xffffb05e
+                    :source==SurfaceBuilder.MODEL?0xffb48cff:0xff778898)
                     :mesh.color[v];
             out.put(mesh.xyz,3*v,3);
             out.put(((color>>16)&255)/255f).put(((color>>8)&255)/255f).put((color&255)/255f);
