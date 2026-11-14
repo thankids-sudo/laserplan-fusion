@@ -69,7 +69,7 @@ jobs:
           fi
 
       - name: Build debug APK
-        run: gradle --no-daemon --stacktrace assembleDebug
+        run: gradle --no-daemon --stacktrace testDebugUnitTest assembleDebug
 
       - name: Verify APK exists and its signature
         run: |

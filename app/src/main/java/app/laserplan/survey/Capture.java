@@ -44,13 +44,11 @@ final class Capture {
     /** Number of non-zero pixels in a 16-bit depth image (any strides). */
     static int nonZero16(Image image) {
         Image.Plane plane=image.getPlanes()[0];
-        ByteBuffer src=plane.getBuffer();
-        int origin=src.position(), rowStride=plane.getRowStride(), pixelStride=plane.getPixelStride(), n=0;
-        for (int y=0; y<image.getHeight(); y++) for (int x=0; x<image.getWidth(); x++) {
-            int i=origin+y*rowStride+x*pixelStride;
-            if (src.get(i)!=0 || src.get(i+1)!=0) n++;
-        }
-        return n;
+        ByteBuffer src=plane.getBuffer().duplicate();
+        src.rewind();
+        byte[] all=new byte[src.remaining()];
+        src.get(all);
+        return CaptureRules.nonZero16(all,0,image.getWidth(),image.getHeight(),plane.getRowStride(),plane.getPixelStride());
     }
 
     static byte[] pack(Image image, int bytesPerPixel) {
@@ -63,7 +61,7 @@ final class Capture {
     private static void copyPlane(Image.Plane plane, int w, int h, int bytes,
                                   byte[] dst, int offset, int step) {
         ByteBuffer src = plane.getBuffer();
-        int origin = src.position();
+        int origin = 0; // absolute from the buffer start, as LaserPlan 13.2 does (duplicate + rewind)
         for (int y=0; y<h; y++) for (int x=0; x<w; x++) {
             int from = origin+y*plane.getRowStride()+x*plane.getPixelStride();
             for (int b=0; b<bytes; b++) dst[offset++] = src.get(from+b);
@@ -172,7 +170,7 @@ final class Capture {
                 .put("rejectedTimingAttempts",rejected).put("photoCount",photos)
                 .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady)
                       .put("emptyRawDepthImagesSkipped",emptyDepth)
-                      .put("confidenceTimestampMismatch",confMismatch).put("poseMatchedFrames",poseMatched)
+                      .put("confidenceTimestampDiffersNotRejected",confMismatch).put("poseMatchedFrames",poseMatched)
                       .put("approximatePoseFrames",poseApprox).put("depthTooOld",poseTooOld)
                       .put("lastClosestPoseErrorUs",bestMatchErrorUs).put("smoothedDepthHadDataWhenRawEmpty",smoothedHadData).put("trackingLostFrames",trackingLost)
                       .put("lastDepthLagMs",depthLagMs).put("pixelsKept",pixelsKept).put("pixelsNoDepth",pixelsZero)

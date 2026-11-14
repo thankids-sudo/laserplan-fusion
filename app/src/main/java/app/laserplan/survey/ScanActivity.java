@@ -53,7 +53,9 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
         layout.setOrientation(LinearLayout.VERTICAL);
         status=new TextView(this);
         status.setPadding(16,12,16,12);
-        status.setText("Starting AR camera…");
+        status.setText(version()+" · Starting AR camera…");
+        // Long-press shares the full capture log, so one test on the phone returns all the data.
+        status.setOnLongClickListener(v->{shareLog();return true;});
         layout.addView(status);
         surface=new GLSurfaceView(this);
         surface.setEGLContextClientVersion(2);
@@ -176,8 +178,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 capture.smoothedHadData=smoothedHadData;
                 capture.confMismatch=confMismatch;capture.poseMatched=poseMatched;
                 capture.poseApprox=poseApprox;capture.poseTooOld=poseTooOld;capture.bestMatchErrorUs=bestMatchErrorUs;
-                if(!capture.hasPoints())throw new IllegalStateException("No usable points yet. "+diagnosis()
-                        +" Resume and move slowly near a textured surface.");
+                if(!capture.hasPoints())throw new IllegalStateException(version()+" · No usable points yet. "+diagnosis()
+                        +" Long-press this message to share the capture log.");
                 File zip=capture.finish(new File(getFilesDir(),"LaserPlan-survey-"+System.currentTimeMillis()+".zip"));
                 runOnUiThread(()->{
                     if(isDestroyed())return;
@@ -270,7 +272,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private String diagnosis(){
         Capture c=capture;
         return String.format(java.util.Locale.US,
-            "Frames saved %d (pose matched %d, approximate %d) · empty depth %d (smoothed had data %d) · confidence mismatch %d · depth too old %d · closest pose %s · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
+            "Frames saved %d (pose matched %d, approximate %d) · empty depth %d (smoothed had data %d) · confidence time differs %d (not rejected) · depth too old %d · closest pose %s · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
             accepted,poseMatched,poseApprox,emptyDepth,smoothedHadData,confMismatch,poseTooOld,
             bestMatchErrorUs<0?"none":String.format(java.util.Locale.US,"%.1f ms",bestMatchErrorUs/1000.0),
             depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
@@ -292,14 +294,41 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
 
     /** Slot of the remembered frame whose timestamp matches [time] within 8 ms, or -1. */
     private int findPose(long time){
-        int best=-1;long bestError=Long.MAX_VALUE;
-        for(int i=0;i<POSES;i++){
-            if(poseTime[i]==0)continue;
-            long error=Math.min(Math.abs(poseTime[i]-time),Math.abs(poseAndroidTime[i]-time));
-            if(error<bestError){bestError=error;best=i;}
+        long[] error=new long[1];
+        int slot=CaptureRules.findPose(poseTime,poseAndroidTime,time,POSE_MATCH_NS,error);
+        bestMatchErrorUs=error[0]<0?-1:error[0]/1000L;
+        return slot;
+    }
+
+    private final java.util.ArrayDeque<String> attempts=new java.util.ArrayDeque<>();
+
+    private void log(String line){
+        synchronized(attempts){
+            attempts.addLast(line);
+            while(attempts.size()>400)attempts.removeFirst();
         }
-        if(best>=0)bestMatchErrorUs=bestError/1000L;
-        return bestError<=POSE_MATCH_NS?best:-1;
+    }
+
+    private String version(){
+        try{
+            android.content.pm.PackageInfo info=getPackageManager().getPackageInfo(getPackageName(),0);
+            return "Fusion "+info.versionName+" ("+info.versionCode+")";
+        }catch(Exception e){return "Fusion";}
+    }
+
+    private void shareLog(){
+        StringBuilder out=new StringBuilder();
+        out.append(version()).append('\n')
+           .append(android.os.Build.MANUFACTURER).append(' ').append(android.os.Build.MODEL)
+           .append(" · Android ").append(android.os.Build.VERSION.RELEASE).append('\n')
+           .append(capture==null?"No capture yet":diagnosis()).append("\n\n")
+           .append("frameMs depthMs confDeltaMs lagMs size nonZero closestPoseMs outcome\n");
+        synchronized(attempts){for(String line:attempts)out.append(line).append('\n');}
+        android.content.Intent send=new android.content.Intent(android.content.Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(android.content.Intent.EXTRA_SUBJECT,"LaserPlan Fusion capture log")
+            .putExtra(android.content.Intent.EXTRA_TEXT,out.toString());
+        startActivity(android.content.Intent.createChooser(send,"Share capture log"));
     }
 
     private void acquire(Frame frame) throws Exception{
@@ -312,13 +341,20 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             if(rawTime==lastRaw)return;
             lastRaw=rawTime;
             depthLagMs=Math.abs(time-rawTime)/1_000_000L;
-            if(conf.getTimestamp()!=rawTime){timingRejected++;confMismatch++;return;}
+            // LaserPlan 13.2 parity: the confidence image is used whenever its size matches; its timestamp
+            // is logged but never rejects depth (0.3–0.5 rejected on it).
+            long confDeltaMs=(conf.getTimestamp()-rawTime)/1_000_000L;
+            if(confDeltaMs!=0)confMismatch++;
             int w=depth.getWidth(),h=depth.getHeight();
-            if(w!=conf.getWidth()||h!=conf.getHeight())return;
+            String head=String.format(java.util.Locale.US,"%d %d %d %d %dx%d",
+                time/1_000_000L,rawTime/1_000_000L,confDeltaMs,depthLagMs,w,h);
+            if(w!=conf.getWidth()||h!=conf.getHeight()){log(head+" - - confidence-size-"+conf.getWidth()+"x"+conf.getHeight());return;}
             // ARCore often hands back raw depth with no measured pixels. Skip it at once and keep trying
             // on the next frames instead of saving an empty frame and waiting a whole interval.
-            if(Capture.nonZero16(depth)<Math.max(1,w*h/200)){
+            int nonZero=Capture.nonZero16(depth);
+            if(CaptureRules.isEmpty(nonZero,w,h)){
                 emptyDepth++;
+                log(head+" "+nonZero+" - empty");
                 try(Image smooth=frame.acquireDepthImage16Bits()){
                     if(Capture.nonZero16(smooth)>0)smoothedHadData++;
                 }catch(Exception ignored){}
@@ -327,6 +363,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             float[] pose=new float[16],k;
             String poseSource;
             int slot=findPose(rawTime);
+            String match=bestMatchErrorUs<0?"-":String.format(java.util.Locale.US,"%.1f",bestMatchErrorUs/1000.0);
             if(slot>=0){
                 System.arraycopy(poseMatrix[slot],0,pose,0,16);
                 float[] m=poseIntrinsics[slot];
@@ -339,7 +376,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 k=Capture.calibration(camera.getTextureIntrinsics(),w,h);
                 poseSource=Math.abs(time-rawTime)<=Capture.MAX_DELTA?"current-frame":"approximate-live-pose";
                 poseApprox++;
-            }else{timingRejected++;poseTooOld++;return;}
+            }else{timingRejected++;poseTooOld++;log(head+" "+nonZero+" "+match+" too-old");return;}
+            log(head+" "+nonZero+" "+match+" saved:"+poseSource);
             byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
             byte[] color=null;int rw=0,rh=0;float[] rgbK=null,rgbPose=null;
             if(accepted%3==0){
