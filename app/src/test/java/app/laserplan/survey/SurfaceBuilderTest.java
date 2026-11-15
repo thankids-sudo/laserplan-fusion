@@ -81,4 +81,56 @@ public class SurfaceBuilderTest {
         assertEquals(0f, z[1], 0f);                                  // pixel (2,0) low confidence
         assertEquals(2f, z[2], 1e-6);
     }
+
+    @Test public void flatSurfaceFillCompletesAWallHole() {
+        int w = 40, h = 30; int[] mm = new int[w * h]; java.util.Arrays.fill(mm, 2000);
+        for (int y = 10; y < 20; y++) for (int x = 10; x < 30; x++) mm[y * w + x] = 0;   // plain white patch, no depth
+        SurfaceBuilder.Frame f = frame(w, h, mm);
+        int[] size = new int[2];
+        float[] z = SurfaceBuilder.sample(f, 0, 5, size);
+        boolean[] est = new boolean[z.length];
+        SurfaceBuilder.planeFill(z, est, size[0], size[1], f, 12);
+        int filled = 0;
+        for (int k = 0; k < z.length; k++) if (est[k]) { filled++; assertEquals(2f, z[k], 0.01f); }
+        assertEquals(5 * 10, filled);
+    }
+
+    @Test public void flatSurfaceFillLeavesADoorwayOpen() {
+        // wall at 2 m above, floor-like surface rising towards the camera below: edges not coplanar
+        int w = 40, h = 30; int[] mm = new int[w * h];
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) mm[y * w + x] = y < 15 ? 2000 : 2000 - (y - 15) * 60;
+        for (int y = 8; y < 24; y++) for (int x = 14; x < 26; x++) mm[y * w + x] = 0;
+        SurfaceBuilder.Frame f = frame(w, h, mm);
+        int[] size = new int[2];
+        float[] z = SurfaceBuilder.sample(f, 0, 5, size);
+        boolean[] est = new boolean[z.length];
+        SurfaceBuilder.planeFill(z, est, size[0], size[1], f, 12);
+        for (boolean e : est) assertFalse(e);
+    }
+
+    @Test public void smoothedDepthFillsOnlyWhereRawIsMissing() {
+        int w = 4, h = 4; int[] mm = new int[w * h]; java.util.Arrays.fill(mm, 2000); mm[0] = 0;
+        SurfaceBuilder.Frame f = frame(w, h, mm);
+        f.smoothMm = new short[w * h]; java.util.Arrays.fill(f.smoothMm, (short) 2100);
+        int[] size = new int[2]; boolean[] smoothed = new boolean[4];
+        float[] z = SurfaceBuilder.sample(f, 0, 5, size, smoothed);
+        assertTrue(smoothed[0]); assertEquals(2.1f, z[0], 1e-6);
+        assertFalse(smoothed[1]); assertEquals(2.0f, z[1], 1e-6);
+        float[] measuredOnly = SurfaceBuilder.sample(f, 0, 5, size);
+        assertEquals(0f, measuredOnly[0], 0f);
+    }
+
+    @Test public void smoothedDepthFrameOnlyFillsWhatMeasuredDepthLeftOpen() {
+        int w = 20, h = 12;
+        int[] mm = new int[w * h]; java.util.Arrays.fill(mm, 2000);
+        for (int y = 0; y < h; y++) for (int x = 10; x < w; x++) mm[y * w + x] = 0;      // right half not measured
+        SurfaceBuilder.Frame measured = frame(w, h, mm);
+        int[] all = new int[w * h]; java.util.Arrays.fill(all, 2000);
+        SurfaceBuilder.Frame smooth = frame(w, h, all); smooth.allEstimated = true; smooth.measured = 0;
+        SurfaceBuilder.Mesh mesh = SurfaceBuilder.build(java.util.Arrays.asList(smooth, measured), null, 0, 1, 0, 5, 100000);
+        assertTrue(mesh.estimated > 0);
+        assertTrue(mesh.uncovered > 0);                       // measured half drawn from the measured frame
+        SurfaceBuilder.Mesh only = SurfaceBuilder.build(java.util.Collections.singletonList(measured), null, 0, 1, 0, 5, 100000);
+        assertEquals(only.triangles, mesh.uncovered);         // the measured surface is unchanged
+    }
 }

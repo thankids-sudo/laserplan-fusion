@@ -17,6 +17,8 @@ final class Fusion {
     int photoFrames, observed, estimated;
     /** Depth frames kept for the surface preview. */
     final List<SurfaceBuilder.Frame> depthFrames=new ArrayList<>();
+    /** ARCore smoothed depth frames (estimates, own pose); used after measured frames when Estimated fill >= 1. */
+    final List<SurfaceBuilder.Frame> smoothFrames=new ArrayList<>();
     /** True when any photo had to use the approximate (crop) alignment of older ZIPs. */
     boolean approximateAlignment;
     int minConfidence=128;
@@ -99,6 +101,7 @@ final class Fusion {
                 double lag=Math.abs(frame.optDouble("depthToCameraDeltaNs",0));
                 if(!poseMatched(frame)&&lag>50_000_000)continue;
                 try{result.depthFrames.add(depthFrame(zip,frame));}catch(Exception skipped){continue;}
+                try{SurfaceBuilder.Frame s=smoothFrame(zip,frame);if(s!=null)result.smoothFrames.add(s);}catch(Exception ignored){}
                 JSONObject rgb=frame.optJSONObject("rgb");
                 if(rgb==null||!rgb.has("file")||zip.getEntry(rgb.optString("file"))==null)continue;
                 if(result.project(zip,frame,rgb,votes,depthScratch,pixelScratch))result.photoFrames++;
@@ -137,6 +140,14 @@ final class Fusion {
         f.width=w;f.height=h;
         f.depthMm=new short[w*h];
         java.nio.ByteBuffer.wrap(depth).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(f.depthMm);
+        JSONObject smooth=frame.optJSONObject("smoothedDepth");
+        if(smooth!=null&&smooth.has("file")&&smooth.optInt("width")==w&&smooth.optInt("height")==h){
+            byte[] s=bytes(zip,smooth.getString("file"),2*w*h);
+            if(s.length==2*w*h){
+                f.smoothMm=new short[w*h];
+                java.nio.ByteBuffer.wrap(s).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(f.smoothMm);
+            }
+        }
         JSONObject conf=frame.optJSONObject("confidence");
         if(conf!=null&&conf.has("file")){
             byte[] c=bytes(zip,conf.getString("file"),w*h);
@@ -148,6 +159,25 @@ final class Fusion {
         if(f.fx<=0||f.fy<=0)throw new IOException("Invalid camera focal length.");
         JSONObject pixels=frame.optJSONObject("pixels");
         f.measured=pixels==null?0:pixels.optInt("accepted",0);
+        return f;
+    }
+
+    /** Smoothed depth stored with its own pose and intrinsics (Fusion 0.10+); null when absent. */
+    private static SurfaceBuilder.Frame smoothFrame(ZipFile zip,JSONObject frame) throws Exception{
+        JSONObject s=frame.optJSONObject("smoothedDepth");
+        if(s==null||!s.has("pose")||!s.has("intrinsics"))return null;
+        int w=s.getInt("width"),h=s.getInt("height");
+        if(w<2||h<2||(long)w*h>500000)return null;
+        byte[] d=bytes(zip,s.getString("file"),2*w*h);
+        if(d.length!=2*w*h)return null;
+        SurfaceBuilder.Frame f=new SurfaceBuilder.Frame();
+        f.width=w;f.height=h;f.depthMm=new short[w*h];
+        java.nio.ByteBuffer.wrap(d).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(f.depthMm);
+        JSONObject k=s.getJSONObject("intrinsics");
+        f.fx=k.getDouble("fx");f.fy=k.getDouble("fy");f.cx=k.getDouble("cx");f.cy=k.getDouble("cy");
+        f.pose=matrix(s.getJSONObject("pose").getJSONArray("matrixColumnMajor"));
+        if(f.pose==null||f.fx<=0||f.fy<=0)return null;
+        f.allEstimated=true;f.measured=0;
         return f;
     }
 
@@ -242,10 +272,54 @@ final class Fusion {
     SurfaceBuilder.Mesh surface(int smoothing,int fill){return surface(smoothing,fill,null);}
 
     /** Surface from measured depth frames; optional AI frames come last, so they only add what is still open. */
+    /**
+     * Raw-depth confidence used for the surface. Lower than the point cloud's, because the surface keeps
+     * only connected triangles (no depth jumps), which removes most low-confidence noise. On the S24 Ultra
+     * scan this took the surface from 54k to 90k triangles before any fill.
+     */
+    static final int SURFACE_MIN_CONFIDENCE=32;
+
     SurfaceBuilder.Mesh surface(int smoothing,int fill,List<SurfaceBuilder.Frame> ai){
-        List<SurfaceBuilder.Frame> frames=depthFrames;
-        if(ai!=null&&!ai.isEmpty()){frames=new ArrayList<>(depthFrames);frames.addAll(ai);}
-        return SurfaceBuilder.build(frames,this::colorNear,smoothing,fill,minConfidence,maxRange,300_000);
+        List<SurfaceBuilder.Frame> frames=new ArrayList<>(depthFrames);
+        if(fill>=1)frames.addAll(smoothFrames);          // estimates come after measured depth, so they only fill gaps
+        if(ai!=null)frames.addAll(ai);
+        return SurfaceBuilder.build(frames,this::colorNear,smoothing,fill,Math.min(minConfidence,SURFACE_MIN_CONFIDENCE),maxRange,300_000);
+    }
+
+    /** Camera views of the calibrated photos, for projective texturing. */
+    List<TextureMapper.View> textureViews(){
+        List<TextureMapper.View> views=new ArrayList<>();
+        for(Photo p:photos){
+            TextureMapper.View v=new TextureMapper.View();
+            v.width=p.width;v.height=p.height;v.fx=p.fx;v.fy=p.fy;v.cx=p.cx;v.cy=p.cy;v.pose=p.pose;
+            views.add(v);
+        }
+        return views;
+    }
+
+    /** Photo-textured surface: mapping plus an atlas of the photos it uses (RGB 565, at most 6×4 photos). */
+    static final class Textured{TextureMapper.Result map;Bitmap atlas;int columns,slotW,slotH;}
+    static final int ATLAS_PHOTOS=24,ATLAS_COLUMNS=6;
+
+    Textured texture(SurfaceBuilder.Mesh mesh){
+        if(photos.isEmpty()||mesh.triangles==0)return null;
+        Textured t=new Textured();
+        t.map=TextureMapper.map(mesh.xyz,mesh.triangles,textureViews(),ATLAS_PHOTOS);
+        if(t.map.used.length==0)return null;
+        int slotW=0,slotH=0;
+        for(int i:t.map.used){slotW=Math.max(slotW,photos.get(i).width);slotH=Math.max(slotH,photos.get(i).height);}
+        int columns=Math.min(ATLAS_COLUMNS,t.map.used.length),rows=(t.map.used.length+columns-1)/columns;
+        t.columns=columns;t.slotW=slotW;t.slotH=slotH;
+        t.atlas=Bitmap.createBitmap(columns*slotW,rows*slotH,Bitmap.Config.RGB_565);
+        android.graphics.Canvas canvas=new android.graphics.Canvas(t.atlas);
+        for(int s=0;s<t.map.used.length;s++){
+            Photo p=photos.get(t.map.used[s]);
+            Bitmap image=BitmapFactory.decodeByteArray(p.jpeg,0,p.jpeg.length);
+            if(image==null)continue;
+            canvas.drawBitmap(image,(s%columns)*slotW,(s/columns)*slotH,null);
+            image.recycle();
+        }
+        return t;
     }
 
     /** Result of running the AI depth fill over all calibrated photos. */

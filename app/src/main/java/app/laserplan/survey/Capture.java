@@ -22,7 +22,11 @@ final class Capture {
     final long interval;
     private final File dir;
     private final Map<Long, Sum> voxels = new LinkedHashMap<>();
-    int frames, rejected, depthNotReady, trackingLost, emptyDepth, smoothedHadData;
+    int frames, rejected, depthNotReady, trackingLost, emptyDepth, smoothedHadData, smoothedFrames, smoothNoPose, smoothEmpty;
+    java.util.Map<String,Integer> smoothErrors=new java.util.TreeMap<>();
+
+    /** ARCore smoothed depth with the pose and intrinsics of the camera frame it belongs to. */
+    static final class Smoothed { int width, height; long timestampNs; byte[] depth; float[] pose, k; }
     int confMismatch, poseMatched, poseApprox, poseTooOld;
     long bestMatchErrorUs=-1;
     long depthLagMs=-1;
@@ -106,7 +110,7 @@ final class Capture {
 
     void writeFrame(long time, long depthTime, int w, int h, byte[] depth, byte[] conf,
                     float[] k, float[] pose, String poseSource, byte[] jpeg, int rw, int rh, float[] rgbK,
-                    float[] rgbPose) throws Exception {
+                    float[] rgbPose, Smoothed smoothDepth) throws Exception {
         int index=frames+1;
         String name=String.format(Locale.US,"%04d",index);
         String depthName="depth/"+name+".raw16le", confName="confidence/"+name+".raw8";
@@ -143,6 +147,21 @@ final class Capture {
             if(rgbPose!=null) rgb.put("cameraTimestampNs",time).put("pose",new JSONObject().put("matrixColumnMajor",matrix(rgbPose)));
             photos++;
         }
+        JSONObject smooth=null;
+        if(smoothDepth!=null&&smoothDepth.depth.length==2*smoothDepth.width*smoothDepth.height){
+            String smoothName="depth-smoothed/"+name+".raw16le";
+            File out=new File(dir,smoothName);
+            File parent=out.getParentFile();
+            if(parent!=null&&!parent.isDirectory()&&!parent.mkdirs())throw new IOException("Cannot create "+parent);
+            write(out,smoothDepth.depth);
+            float[] sk=smoothDepth.k;
+            smooth=new JSONObject().put("file",smoothName).put("width",smoothDepth.width).put("height",smoothDepth.height)
+                .put("timestampNs",smoothDepth.timestampNs)
+                .put("intrinsics",new JSONObject().put("fx",sk[0]).put("fy",sk[1]).put("cx",sk[2]).put("cy",sk[3]))
+                .put("pose",new JSONObject().put("matrixColumnMajor",matrix(smoothDepth.pose)).put("source","matched-frame"))
+                .put("note","ARCore smoothed depth (Frame.acquireDepthImage16Bits), an estimate with its own matched pose; used only where measured depth leaves the surface open");
+            smoothedFrames++;
+        }
         JSONObject frame=new JSONObject().put("index",index).put("valid",true)
                 .put("cameraTimestampNs",time).put("depthTimestampNs",depthTime)
                 .put("depthToCameraDeltaNs",depthTime-time)
@@ -150,6 +169,7 @@ final class Capture {
                 .put("confidence",new JSONObject().put("file",confName).put("width",w).put("height",h))
                 .put("intrinsics",new JSONObject().put("depth",intrinsics(k,w,h)))
                 .put("pose",new JSONObject().put("matrixColumnMajor",matrix(pose)).put("source",poseSource))
+                .put("smoothedDepth",smooth==null?JSONObject.NULL:smooth)
                 .put("pixels",new JSONObject().put("accepted",count).put("noDepth",zero).put("tooFar",far).put("lowConfidence",low)).put("rgb",rgb);
         write(new File(dir,"frames/"+name+".json"),frame.toString().getBytes(StandardCharsets.UTF_8));
         frames++;
@@ -169,7 +189,9 @@ final class Capture {
                 .put("frameCount",frames).put("validFrameCount",frames).put("pointCount",voxels.size())
                 .put("rejectedTimingAttempts",rejected).put("photoCount",photos)
                 .put("diagnostics",new JSONObject().put("depthNotReady",depthNotReady)
-                      .put("emptyRawDepthImagesSkipped",emptyDepth)
+                      .put("emptyRawDepthImagesSkipped",emptyDepth).put("framesWithSmoothedDepth",smoothedFrames)
+                      .put("smoothedDepthNoPose",smoothNoPose).put("smoothedDepthEmpty",smoothEmpty)
+                      .put("smoothedDepthErrors",new JSONObject(smoothErrors))
                       .put("confidenceTimestampDiffersNotRejected",confMismatch).put("poseMatchedFrames",poseMatched)
                       .put("approximatePoseFrames",poseApprox).put("depthTooOld",poseTooOld)
                       .put("lastClosestPoseErrorUs",bestMatchErrorUs).put("smoothedDepthHadDataWhenRawEmpty",smoothedHadData).put("trackingLostFrames",trackingLost)

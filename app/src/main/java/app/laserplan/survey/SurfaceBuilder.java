@@ -33,6 +33,8 @@ final class SurfaceBuilder {
         double[] pose;        // world_from_camera, column-major 4x4
         double fx, fy, cx, cy;
         int measured;         // valid pixels, used to order frames
+        short[] smoothMm;     // optional: ARCore smoothed depth (an estimate), used only where raw depth is missing
+        boolean allEstimated; // whole frame is an estimate (ARCore smoothed depth with its own pose)
         byte[] modelMask;     // optional: non-zero where depth is an AI estimate (GuidedFill)
         int[] pixelColor;     // optional: photo colour per pixel for AI-estimated cells
     }
@@ -51,6 +53,11 @@ final class SurfaceBuilder {
 
     /** Samples the depth image on a STRIDE grid in metres; 0 = no usable depth. */
     static float[] sample(Frame f, int minConfidence, float maxRange, int[] size) {
+        return sample(f, minConfidence, maxRange, size, null);
+    }
+
+    /** As above; when smoothed is given, cells without usable raw depth take ARCore's smoothed depth and are flagged. */
+    static float[] sample(Frame f, int minConfidence, float maxRange, int[] size, boolean[] smoothed) {
         int gw = f.width / STRIDE, gh = f.height / STRIDE;
         size[0] = gw; size[1] = gh;
         float[] z = new float[gw * gh];
@@ -58,7 +65,13 @@ final class SurfaceBuilder {
             int at = (j * STRIDE) * f.width + i * STRIDE;
             int mm = f.depthMm[at] & 0xffff;
             int c = f.confidence == null ? 255 : f.confidence[at] & 255;
-            if (mm == 0 || c < minConfidence || mm > maxRange * 1000f) continue;
+            if (mm == 0 || c < minConfidence || mm > maxRange * 1000f) {
+                if (smoothed != null && f.smoothMm != null) {
+                    int sm = f.smoothMm[at] & 0xffff;
+                    if (sm > 0 && sm <= maxRange * 1000f) { z[j * gw + i] = sm * 0.001f; smoothed[j * gw + i] = true; }
+                }
+                continue;
+            }
             z[j * gw + i] = mm * 0.001f;
         }
         return z;
@@ -87,6 +100,45 @@ final class SurfaceBuilder {
         }
         return estimated;
     }
+
+    /**
+     * Flat-surface fill (no AI). On any flat surface, inverse depth changes linearly across the image.
+     * An empty cell is filled only when the depth interpolated (in inverse depth) between the nearest
+     * measured cells to its left and right agrees with the depth interpolated between those above and
+     * below (within 1.2 cm + 0.6 % of range). Plain walls, floors and table tops pass exactly; a doorway,
+     * a corner or a gap between different surfaces gives two different answers and stays open.
+     */
+    static void planeFill(float[] z, boolean[] estimated, int gw, int gh, Frame f, int reach) {
+        if (reach <= 0) return;
+        float[] before = z.clone();
+        int[] di = {-1, 1, 0, 0}, dj = {0, 0, -1, 1};
+        float[] d = new float[4]; int[] s = new int[4];
+        for (int j = 0; j < gh; j++) for (int i = 0; i < gw; i++) {
+            int at = j * gw + i;
+            if (before[at] > 0) continue;
+            boolean all = true;
+            for (int k = 0; k < 4 && all; k++) {
+                all = false;
+                for (int step = 1; step <= reach; step++) {
+                    int x = i + di[k] * step, y = j + dj[k] * step;
+                    if (x < 0 || y < 0 || x >= gw || y >= gh) break;
+                    float v = before[y * gw + x];
+                    if (v > 0) { d[k] = v; s[k] = step; all = true; break; }
+                }
+            }
+            if (!all) continue;
+            // inverse depth interpolated along the row (left, right) and along the column (up, down)
+            double row = 1 / d[0] + (1 / d[1] - 1 / d[0]) * s[0] / (double) (s[0] + s[1]);
+            double col = 1 / d[2] + (1 / d[3] - 1 / d[2]) * s[2] / (double) (s[2] + s[3]);
+            if (row <= 0 || col <= 0) continue;
+            double zr = 1 / row, zc = 1 / col;
+            if (Math.abs(zr - zc) > 0.012 + 0.006 * Math.min(zr, zc)) continue;
+            z[at] = (float) (2 / (row + col)); estimated[at] = true;
+        }
+    }
+
+    /** Plane-fill reach in grid cells for the "Estimated fill" level (0-4): off for 0-1, then 12/24/40. */
+    static int planeReach(int fill) { return fill <= 1 ? 0 : fill == 2 ? 12 : fill == 3 ? 24 : 40; }
 
     /** Edge-preserving smoothing: each pass averages a cell with 4-neighbours on the same surface. */
     static void smooth(float[] z, int gw, int gh, int passes) {
@@ -126,9 +178,13 @@ final class SurfaceBuilder {
         int[] size = new int[2], src = new int[1];
         for (int fi = 0; fi < order.size() && mesh.triangles < maxTriangles; fi++) {
             Frame f = order.get(fi);
-            float[] z = sample(f, minConfidence, maxRange, size);
+            // "Estimated fill" 0 = measured depth only; from 1, ARCore smoothed depth (if recorded) fills raw gaps.
+            boolean[] smoothed = new boolean[(f.width / STRIDE) * (f.height / STRIDE)];
+            float[] z = sample(f, minConfidence, maxRange, size, fill >= 1 ? smoothed : null);
             int gw = size[0], gh = size[1];
-            boolean[] estimated = fill(z, gw, gh, fill);
+            boolean[] estimated = fill(z, gw, gh, Math.min(fill, 2));
+            for (int k = 0; k < estimated.length; k++) estimated[k] |= smoothed[k] || f.allEstimated;
+            planeFill(z, estimated, gw, gh, f, planeReach(fill));
             smooth(z, gw, gh, smoothing);
             // World position, colour and source of every grid cell with depth.
             float[] world = new float[gw * gh * 3];

@@ -34,6 +34,9 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
     private volatile Capture capture;
     private long lastAccepted,lastRaw,lastStatus;
     private volatile int accepted,timingRejected,depthNotReady,trackingLost,emptyDepth,smoothedHadData;
+    // Smoothed-depth diagnostics: saved with its own matched pose, no pose found, empty, and errors by type.
+    private volatile int smoothSaved,smoothNoPose,smoothEmpty;
+    private final java.util.TreeMap<String,Integer> smoothErrors=new java.util.TreeMap<>();
     private volatile int confMismatch,poseMatched,poseApprox,poseTooOld;
     private volatile long bestMatchErrorUs=-1;
     private static final long APPROX_POSE_NS=100_000_000L;
@@ -156,6 +159,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 new long[]{300,600,1000}[interval.getSelectedItemPosition()]*1_000_000L);
             java.util.Arrays.fill(poseTime,0);java.util.Arrays.fill(poseAndroidTime,0);
             timingRejected=0;depthNotReady=0;trackingLost=0;emptyDepth=0;smoothedHadData=0;
+            smoothSaved=0;smoothNoPose=0;smoothEmpty=0;synchronized(smoothErrors){smoothErrors.clear();}
             confMismatch=0;poseMatched=0;poseApprox=0;poseTooOld=0;bestMatchErrorUs=-1;depthLagMs=-1;lastRaw=0;lastAccepted=0;
             for(android.view.View v:new android.view.View[]{confidence,range,interval,start})v.setEnabled(false);
             pause.setText("Pause");pause.setEnabled(true);finish.setEnabled(true);
@@ -176,6 +180,8 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
                 capture.depthLagMs=depthLagMs;
                 capture.emptyDepth=emptyDepth;
                 capture.smoothedHadData=smoothedHadData;
+                capture.smoothNoPose=smoothNoPose;capture.smoothEmpty=smoothEmpty;
+                synchronized(smoothErrors){capture.smoothErrors=new java.util.TreeMap<>(smoothErrors);}
                 capture.confMismatch=confMismatch;capture.poseMatched=poseMatched;
                 capture.poseApprox=poseApprox;capture.poseTooOld=poseTooOld;capture.bestMatchErrorUs=bestMatchErrorUs;
                 if(!capture.hasPoints())throw new IllegalStateException(version()+" · No usable points yet. "+diagnosis()
@@ -269,11 +275,15 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
         GLES20.glEnableVertexAttribArray(p);GLES20.glEnableVertexAttribArray(t);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
     }
+    private String smoothErrorText(){
+        synchronized(smoothErrors){return smoothErrors.isEmpty()?"none":smoothErrors.toString();}
+    }
+
     private String diagnosis(){
         Capture c=capture;
         return String.format(java.util.Locale.US,
-            "Frames saved %d (pose matched %d, approximate %d) · empty depth %d (smoothed had data %d) · confidence time differs %d (not rejected) · depth too old %d · closest pose %s · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
-            accepted,poseMatched,poseApprox,emptyDepth,smoothedHadData,confMismatch,poseTooOld,
+            "Frames saved %d (pose matched %d, approximate %d) · empty depth %d (smoothed had data %d) · smoothed depth saved %d, no pose %d, empty %d, errors %s · confidence time differs %d (not rejected) · depth too old %d · closest pose %s · depth not ready %d · tracking lost %d · depth lag %s · pixels kept %,d, no depth %,d, too far %,d, low confidence %,d.",
+            accepted,poseMatched,poseApprox,emptyDepth,smoothedHadData,smoothSaved,smoothNoPose,smoothEmpty,smoothErrorText(),confMismatch,poseTooOld,
             bestMatchErrorUs<0?"none":String.format(java.util.Locale.US,"%.1f ms",bestMatchErrorUs/1000.0),
             depthNotReady,trackingLost,depthLagMs<0?"unknown":depthLagMs+" ms",
             c==null?0:c.pixelsKept,c==null?0:c.pixelsZero,c==null?0:c.pixelsFar,c==null?0:c.pixelsLowConfidence);
@@ -379,8 +389,30 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             }else{timingRejected++;poseTooOld++;log(head+" "+nonZero+" "+match+" too-old");return;}
             log(head+" "+nonZero+" "+match+" saved:"+poseSource);
             byte[] d=Capture.pack(depth,2),c=Capture.pack(conf,1);
+            // ARCore's smoothed depth (an estimate, dense on plain walls and floors). It arrives with its own
+            // timestamp, so, like raw depth, it gets the pose of the camera frame it belongs to (0.9 required the
+            // raw depth's timestamp and saved none on the S24 Ultra).
+            Capture.Smoothed smooth=null;
+            try(Image s=frame.acquireDepthImage16Bits()){
+                int sw=s.getWidth(),sh=s.getHeight(),sNonZero=Capture.nonZero16(s);
+                long[] err=new long[1];
+                int sslot=CaptureRules.findPose(poseTime,poseAndroidTime,s.getTimestamp(),POSE_MATCH_NS,err);
+                if(CaptureRules.isEmpty(sNonZero,sw,sh))smoothEmpty++;
+                else if(sslot<0)smoothNoPose++;
+                else{
+                    smooth=new Capture.Smoothed();
+                    smooth.width=sw;smooth.height=sh;smooth.timestampNs=s.getTimestamp();smooth.depth=Capture.pack(s,2);
+                    smooth.pose=new float[16];System.arraycopy(poseMatrix[sslot],0,smooth.pose,0,16);
+                    float[] m=poseIntrinsics[sslot];
+                    smooth.k=Capture.calibration(new float[]{m[0],m[1]},new float[]{m[2],m[3]},new int[]{(int)m[4],(int)m[5]},sw,sh);
+                    smoothSaved++;
+                }
+            }catch(Exception e){
+                synchronized(smoothErrors){smoothErrors.merge(e.getClass().getSimpleName(),1,Integer::sum);}
+            }
+            final Capture.Smoothed smoothDepth=smooth;
             byte[] color=null;int rw=0,rh=0;float[] rgbK=null,rgbPose=null;
-            if(accepted%3==0){
+            {  // a photo with every depth frame: more views to choose texture from
                 try(Image rgb=frame.acquireCameraImage()){
                     rw=rgb.getWidth();rh=rgb.getHeight();
                     rgbK=Capture.calibration(camera.getImageIntrinsics(),rw,rh);
@@ -394,7 +426,7 @@ public final class ScanActivity extends Activity implements GLSurfaceView.Render
             busy=true;
             writer.execute(()->{
                 try{
-                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,source,jpeg,photoW,photoH,photoK,photoPose);
+                    target.writeFrame(time,rawTime,w,h,d,c,k,pose,source,jpeg,photoW,photoH,photoK,photoPose,smoothDepth);
                     accepted=target.frames;
                     if(accepted>=Capture.MAX_FRAMES){
                         recording=false;
