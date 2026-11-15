@@ -34,6 +34,7 @@ final class SurfaceBuilder {
         double fx, fy, cx, cy;
         int measured;         // valid pixels, used to order frames
         short[] smoothMm;     // optional: ARCore smoothed depth (an estimate), used only where raw depth is missing
+        boolean allEstimated; // whole frame is an estimate (ARCore smoothed depth with its own pose)
         byte[] modelMask;     // optional: non-zero where depth is an AI estimate (GuidedFill)
         int[] pixelColor;     // optional: photo colour per pixel for AI-estimated cells
     }
@@ -182,7 +183,7 @@ final class SurfaceBuilder {
             float[] z = sample(f, minConfidence, maxRange, size, fill >= 1 ? smoothed : null);
             int gw = size[0], gh = size[1];
             boolean[] estimated = fill(z, gw, gh, Math.min(fill, 2));
-            for (int k = 0; k < estimated.length; k++) estimated[k] |= smoothed[k];
+            for (int k = 0; k < estimated.length; k++) estimated[k] |= smoothed[k] || f.allEstimated;
             planeFill(z, estimated, gw, gh, f, planeReach(fill));
             smooth(z, gw, gh, smoothing);
             // World position, colour and source of every grid cell with depth.

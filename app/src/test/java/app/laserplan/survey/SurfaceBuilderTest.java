@@ -119,4 +119,18 @@ public class SurfaceBuilderTest {
         float[] measuredOnly = SurfaceBuilder.sample(f, 0, 5, size);
         assertEquals(0f, measuredOnly[0], 0f);
     }
+
+    @Test public void smoothedDepthFrameOnlyFillsWhatMeasuredDepthLeftOpen() {
+        int w = 20, h = 12;
+        int[] mm = new int[w * h]; java.util.Arrays.fill(mm, 2000);
+        for (int y = 0; y < h; y++) for (int x = 10; x < w; x++) mm[y * w + x] = 0;      // right half not measured
+        SurfaceBuilder.Frame measured = frame(w, h, mm);
+        int[] all = new int[w * h]; java.util.Arrays.fill(all, 2000);
+        SurfaceBuilder.Frame smooth = frame(w, h, all); smooth.allEstimated = true; smooth.measured = 0;
+        SurfaceBuilder.Mesh mesh = SurfaceBuilder.build(java.util.Arrays.asList(smooth, measured), null, 0, 1, 0, 5, 100000);
+        assertTrue(mesh.estimated > 0);
+        assertTrue(mesh.uncovered > 0);                       // measured half drawn from the measured frame
+        SurfaceBuilder.Mesh only = SurfaceBuilder.build(java.util.Collections.singletonList(measured), null, 0, 1, 0, 5, 100000);
+        assertEquals(only.triangles, mesh.uncovered);         // the measured surface is unchanged
+    }
 }

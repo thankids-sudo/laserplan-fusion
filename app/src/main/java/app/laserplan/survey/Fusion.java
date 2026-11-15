@@ -17,6 +17,8 @@ final class Fusion {
     int photoFrames, observed, estimated;
     /** Depth frames kept for the surface preview. */
     final List<SurfaceBuilder.Frame> depthFrames=new ArrayList<>();
+    /** ARCore smoothed depth frames (estimates, own pose); used after measured frames when Estimated fill >= 1. */
+    final List<SurfaceBuilder.Frame> smoothFrames=new ArrayList<>();
     /** True when any photo had to use the approximate (crop) alignment of older ZIPs. */
     boolean approximateAlignment;
     int minConfidence=128;
@@ -99,6 +101,7 @@ final class Fusion {
                 double lag=Math.abs(frame.optDouble("depthToCameraDeltaNs",0));
                 if(!poseMatched(frame)&&lag>50_000_000)continue;
                 try{result.depthFrames.add(depthFrame(zip,frame));}catch(Exception skipped){continue;}
+                try{SurfaceBuilder.Frame s=smoothFrame(zip,frame);if(s!=null)result.smoothFrames.add(s);}catch(Exception ignored){}
                 JSONObject rgb=frame.optJSONObject("rgb");
                 if(rgb==null||!rgb.has("file")||zip.getEntry(rgb.optString("file"))==null)continue;
                 if(result.project(zip,frame,rgb,votes,depthScratch,pixelScratch))result.photoFrames++;
@@ -156,6 +159,25 @@ final class Fusion {
         if(f.fx<=0||f.fy<=0)throw new IOException("Invalid camera focal length.");
         JSONObject pixels=frame.optJSONObject("pixels");
         f.measured=pixels==null?0:pixels.optInt("accepted",0);
+        return f;
+    }
+
+    /** Smoothed depth stored with its own pose and intrinsics (Fusion 0.10+); null when absent. */
+    private static SurfaceBuilder.Frame smoothFrame(ZipFile zip,JSONObject frame) throws Exception{
+        JSONObject s=frame.optJSONObject("smoothedDepth");
+        if(s==null||!s.has("pose")||!s.has("intrinsics"))return null;
+        int w=s.getInt("width"),h=s.getInt("height");
+        if(w<2||h<2||(long)w*h>500000)return null;
+        byte[] d=bytes(zip,s.getString("file"),2*w*h);
+        if(d.length!=2*w*h)return null;
+        SurfaceBuilder.Frame f=new SurfaceBuilder.Frame();
+        f.width=w;f.height=h;f.depthMm=new short[w*h];
+        java.nio.ByteBuffer.wrap(d).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(f.depthMm);
+        JSONObject k=s.getJSONObject("intrinsics");
+        f.fx=k.getDouble("fx");f.fy=k.getDouble("fy");f.cx=k.getDouble("cx");f.cy=k.getDouble("cy");
+        f.pose=matrix(s.getJSONObject("pose").getJSONArray("matrixColumnMajor"));
+        if(f.pose==null||f.fx<=0||f.fy<=0)return null;
+        f.allEstimated=true;f.measured=0;
         return f;
     }
 
@@ -258,8 +280,9 @@ final class Fusion {
     static final int SURFACE_MIN_CONFIDENCE=32;
 
     SurfaceBuilder.Mesh surface(int smoothing,int fill,List<SurfaceBuilder.Frame> ai){
-        List<SurfaceBuilder.Frame> frames=depthFrames;
-        if(ai!=null&&!ai.isEmpty()){frames=new ArrayList<>(depthFrames);frames.addAll(ai);}
+        List<SurfaceBuilder.Frame> frames=new ArrayList<>(depthFrames);
+        if(fill>=1)frames.addAll(smoothFrames);          // estimates come after measured depth, so they only fill gaps
+        if(ai!=null)frames.addAll(ai);
         return SurfaceBuilder.build(frames,this::colorNear,smoothing,fill,Math.min(minConfidence,SURFACE_MIN_CONFIDENCE),maxRange,300_000);
     }
 
