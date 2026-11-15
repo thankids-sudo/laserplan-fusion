@@ -22,6 +22,29 @@ final class TextureMapper {
         int width, height;
         double fx, fy, cx, cy;
         double[] pose;          // world_from_camera, column-major
+        /** Depth recorded with this photo (raw, then ARCore smoothed); judges visibility at that moment. */
+        DepthCheck[] depth = new DepthCheck[0];
+    }
+
+    /** A depth image with its own pose and intrinsics, in metres (0 = no measurement). */
+    static final class DepthCheck {
+        int width, height;
+        float[] metres;
+        double fx, fy, cx, cy;
+        double[] pose;
+
+        /** 1 = agrees (visible), -1 = something else was there (hidden or ghost), 0 = no measurement. */
+        int test(double wx, double wy, double wz) {
+            double[] m = pose;
+            double x = wx - m[12], y = wy - m[13], z = wz - m[14];
+            double a = m[0] * x + m[1] * y + m[2] * z, b = m[4] * x + m[5] * y + m[6] * z, c = -(m[8] * x + m[9] * y + m[10] * z);
+            if (c <= 0.1) return 0;
+            int u = (int) Math.round(fx * a / c + cx), v = (int) Math.round(cy - fy * b / c);
+            if (u < 0 || v < 0 || u >= width || v >= height) return 0;
+            float d = metres[v * width + u];
+            if (d <= 0) return 0;
+            return Math.abs(c - d) <= 0.05 + 0.03 * d ? 1 : -1;
+        }
     }
 
     static final class Result {
@@ -114,25 +137,36 @@ final class TextureMapper {
             }
             for (int i = 0; i < t; i++) {
                 int q = 3 * i;
+                if (pz[q] <= 0.15f || pz[q + 1] <= 0.15f || pz[q + 2] <= 0.15f) continue;
                 boolean inside = true;
                 float edge = Float.MAX_VALUE;
                 for (int k = 0; k < 3; k++) {
                     float u = pu[q + k], v = pv[q + k];
-                    if (pz[q + k] <= 0.15f || u < 0 || v < 0 || u > p.width - 1 || v > p.height - 1) { inside = false; break; }
+                    if (u < 0 || v < 0 || u > p.width - 1 || v > p.height - 1) inside = false;
                     edge = Math.min(edge, Math.min(Math.min(u, p.width - u), Math.min(v, p.height - v)));
                 }
-                if (!inside) continue;
                 float cu = (pu[q] + pu[q + 1] + pu[q + 2]) / 3, cv = (pv[q] + pv[q + 1] + pv[q + 2]) / 3;
+                // A triangle crossing the photo border may still use it when its centre is inside: corners are
+                // clamped to the image (slight stretch at the very edge), at a quarter of the score of a full fit.
+                if (!inside && (cu < 0 || cv < 0 || cu > p.width - 1 || cv > p.height - 1)) continue;
                 float cz = (pz[q] + pz[q + 1] + pz[q + 2]) / 3;
+                // Visibility at the moment of the photo: its own depth decides where it measured something
+                // (people who moved and drifted copies cannot hide or paint a surface); elsewhere the mesh decides.
+                int verdict = 0;
+                for (DepthCheck dc : p.depth) { verdict = dc.test(cen[3 * i], cen[3 * i + 1], cen[3 * i + 2]); if (verdict != 0) break; }
+                if (verdict < 0) continue;
                 int g = ((int) cv >> 2) * gw + ((int) cu >> 2);
-                if (cz > zbuf[g] + 0.04f + 0.015f * cz) continue;                     // hidden behind a nearer surface
+                if (verdict == 0 && cz > zbuf[g] + 0.04f + 0.015f * cz) continue;     // hidden behind a nearer surface
                 double vx = m[12] - cen[3 * i], vy = m[13] - cen[3 * i + 1], vz = m[14] - cen[3 * i + 2];
                 double dist = Math.sqrt(vx * vx + vy * vy + vz * vz);
                 double cos = Math.abs(nrm[3 * i] * vx + nrm[3 * i + 1] * vy + nrm[3 * i + 2] * vz) / dist;
-                float s = (float) (cos * cos / Math.max(dist, 0.3) * Math.max(0.2, Math.min(1, edge / 80.0)));
+                float s = (float) (cos * cos / Math.max(dist, 0.3) * (inside ? Math.max(0.2, Math.min(1, edge / 80.0)) : 0.05));
                 if (s > score[i]) {
                     score[i] = s; best[i] = pi;
-                    if (uvOut != null) for (int k = 0; k < 3; k++) { uvOut[6 * i + 2 * k] = pu[q + k]; uvOut[6 * i + 2 * k + 1] = pv[q + k]; }
+                    if (uvOut != null) for (int k = 0; k < 3; k++) {
+                        uvOut[6 * i + 2 * k] = Math.max(0, Math.min(p.width - 1, pu[q + k]));
+                        uvOut[6 * i + 2 * k + 1] = Math.max(0, Math.min(p.height - 1, pv[q + k]));
+                    }
                 }
             }
         }

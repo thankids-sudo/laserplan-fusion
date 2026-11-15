@@ -58,4 +58,33 @@ public class TextureMapperTest {
         assertEquals(4, r.used.length);
         assertEquals(4, r.textured);
     }
+
+    static TextureMapper.DepthCheck depthAt(float metres) {
+        TextureMapper.DepthCheck d = new TextureMapper.DepthCheck();
+        d.width = 64; d.height = 48; d.fx = d.fy = 40; d.cx = 32; d.cy = 24; d.pose = IDENTITY.clone();
+        d.metres = new float[64 * 48]; java.util.Arrays.fill(d.metres, metres);
+        return d;
+    }
+
+    @Test public void photosOwnDepthOverridesAGhostInTheMesh() {
+        // mesh: a "ghost" (e.g. a person who later moved) at 1 m in front of a wall at 3 m.
+        // The photo's own depth saw the wall at 3 m, so the wall IS visible in this photo.
+        float[] xyz = new float[18];
+        System.arraycopy(triangle(0, 1), 0, xyz, 0, 9);
+        System.arraycopy(triangle(0, 3), 0, xyz, 9, 9);
+        TextureMapper.View v = view(0); v.depth = new TextureMapper.DepthCheck[]{depthAt(3f)};
+        TextureMapper.Result r = TextureMapper.map(xyz, 2, Arrays.asList(v), 4);
+        assertEquals(0, r.photo[1]);                 // wall textured from the photo
+        assertEquals(-1, r.photo[0]);                // the ghost was not there when this photo was taken
+    }
+
+    @Test public void withoutDepthTheMeshStillDecides() {
+        float[] xyz = new float[18];
+        System.arraycopy(triangle(0, 1), 0, xyz, 0, 9);
+        System.arraycopy(triangle(0, 3), 0, xyz, 9, 9);
+        TextureMapper.View v = view(0); v.depth = new TextureMapper.DepthCheck[]{depthAt(0f)};   // no measurement
+        TextureMapper.Result r = TextureMapper.map(xyz, 2, Arrays.asList(v), 4);
+        assertEquals(0, r.photo[0]);
+        assertEquals(-1, r.photo[1]);
+    }
 }

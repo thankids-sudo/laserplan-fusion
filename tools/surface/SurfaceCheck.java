@@ -12,7 +12,13 @@ public class SurfaceCheck {
         String dir = a[0]; int smoothing = Integer.parseInt(a[1]), fill = Integer.parseInt(a[2]);
         int minConf = Integer.parseInt(a[3]);
         List<SurfaceBuilder.Frame> frames = new ArrayList<>();
-        for (String line : Files.readAllLines(Paths.get(dir, "frames.txt"))) {
+        List<String> lines = new ArrayList<>(Files.readAllLines(Paths.get(dir, "frames.txt")));
+        int measuredLines = lines.size();
+        // optional 5th argument "smooth": add ARCore smoothed-depth frames (all estimated), as the app does at fill >= 1
+        if (a.length > 4 && a[4].equals("smooth") && fill >= 1 && Files.exists(Paths.get(dir, "frames_smooth.txt")))
+            lines.addAll(Files.readAllLines(Paths.get(dir, "frames_smooth.txt")));
+        int lineNo = 0;
+        for (String line : lines) {
             String[] t = line.trim().split(" ");
             var f = new SurfaceBuilder.Frame();
             f.width = Integer.parseInt(t[0]); f.height = Integer.parseInt(t[1]);
@@ -23,6 +29,7 @@ public class SurfaceCheck {
             f.confidence = t[7].equals("-") ? null : Files.readAllBytes(Paths.get(t[7]));
             f.measured = Integer.parseInt(t[8]);
             f.pose = new double[16]; for (int i = 0; i < 16; i++) f.pose[i] = Double.parseDouble(t[9 + i]);
+            f.allEstimated = lineNo++ >= measuredLines;
             frames.add(f);
         }
         byte[] raw = Files.readAllBytes(Paths.get(dir, "colors.bin"));
@@ -47,7 +54,7 @@ public class SurfaceCheck {
         var mesh = SurfaceBuilder.build(frames, colors, smoothing, fill, minConf, 5f, 300000);
         long ms = (System.nanoTime() - t0) / 1_000_000;
         try (DataOutputStream o = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(
-                Paths.get(dir, "mesh_s" + smoothing + "_f" + fill + ".bin").toFile())))) {
+                Paths.get(dir, "mesh_s" + smoothing + "_f" + fill + (a.length > 4 ? "_" + a[4] : "") + ".bin").toFile())))) {
             ByteBuffer out = ByteBuffer.allocate(mesh.xyz.length * 4 + mesh.color.length * 4 + mesh.source.length).order(ByteOrder.LITTLE_ENDIAN);
             for (float v : mesh.xyz) out.putFloat(v);
             for (int v : mesh.color) out.putInt(v);

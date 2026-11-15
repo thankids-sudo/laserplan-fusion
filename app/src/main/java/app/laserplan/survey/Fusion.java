@@ -24,7 +24,7 @@ final class Fusion {
     int minConfidence=128;
     /** Calibrated photos (own intrinsics and pose) kept for the optional AI depth fill. */
     final List<Photo> photos=new ArrayList<>();
-    static final class Photo{byte[] jpeg;int width,height;double fx,fy,cx,cy;double[] pose;}
+    static final class Photo{byte[] jpeg;int width,height;double fx,fy,cx,cy;double[] pose;SurfaceBuilder.Frame raw,smooth;}
     float maxRange=5;
     float span=.1f;
     private final HashMap<Long,Integer> cells=new HashMap<>();
@@ -100,11 +100,14 @@ final class Fusion {
                 // otherwise (older or approximate captures) only within 50 ms of the live pose.
                 double lag=Math.abs(frame.optDouble("depthToCameraDeltaNs",0));
                 if(!poseMatched(frame)&&lag>50_000_000)continue;
-                try{result.depthFrames.add(depthFrame(zip,frame));}catch(Exception skipped){continue;}
-                try{SurfaceBuilder.Frame s=smoothFrame(zip,frame);if(s!=null)result.smoothFrames.add(s);}catch(Exception ignored){}
+                SurfaceBuilder.Frame raw,smooth=null;
+                try{raw=depthFrame(zip,frame);result.depthFrames.add(raw);}catch(Exception skipped){continue;}
+                try{smooth=smoothFrame(zip,frame);if(smooth!=null)result.smoothFrames.add(smooth);}catch(Exception ignored){}
+                int photosBefore=result.photos.size();
                 JSONObject rgb=frame.optJSONObject("rgb");
                 if(rgb==null||!rgb.has("file")||zip.getEntry(rgb.optString("file"))==null)continue;
                 if(result.project(zip,frame,rgb,votes,depthScratch,pixelScratch))result.photoFrames++;
+                if(result.photos.size()>photosBefore){Photo kept=result.photos.get(photosBefore);kept.raw=raw;kept.smooth=smooth;}
             }
             for(int i=0;i<result.colors.length;i++){
                 float w=votes[3][i];
@@ -292,14 +295,29 @@ final class Fusion {
         for(Photo p:photos){
             TextureMapper.View v=new TextureMapper.View();
             v.width=p.width;v.height=p.height;v.fx=p.fx;v.fy=p.fy;v.cx=p.cx;v.cy=p.cy;v.pose=p.pose;
+            List<TextureMapper.DepthCheck> checks=new ArrayList<>();
+            if(p.raw!=null)checks.add(depthCheck(p.raw,SURFACE_MIN_CONFIDENCE));
+            if(p.smooth!=null)checks.add(depthCheck(p.smooth,0));
+            v.depth=checks.toArray(new TextureMapper.DepthCheck[0]);
             views.add(v);
         }
         return views;
     }
 
-    /** Photo-textured surface: mapping plus an atlas of the photos it uses (RGB 565, at most 6×4 photos). */
+    private TextureMapper.DepthCheck depthCheck(SurfaceBuilder.Frame f,int minConf){
+        TextureMapper.DepthCheck d=new TextureMapper.DepthCheck();
+        d.width=f.width;d.height=f.height;d.fx=f.fx;d.fy=f.fy;d.cx=f.cx;d.cy=f.cy;d.pose=f.pose;
+        d.metres=new float[f.width*f.height];
+        for(int i=0;i<d.metres.length;i++){
+            int mm=f.depthMm[i]&0xffff,c=f.confidence==null?255:f.confidence[i]&255;
+            if(mm>0&&c>=minConf&&mm<=maxRange*1000)d.metres[i]=mm*0.001f;
+        }
+        return d;
+    }
+
+    /** Photo-textured surface: mapping plus an atlas of the photos it uses (RGB 565, at most 6×8 photos). */
     static final class Textured{TextureMapper.Result map;Bitmap atlas;int columns,slotW,slotH;}
-    static final int ATLAS_PHOTOS=24,ATLAS_COLUMNS=6;
+    static final int ATLAS_PHOTOS=48,ATLAS_COLUMNS=6;   // 6×8 slots of 640×480 = 3840×3840
 
     Textured texture(SurfaceBuilder.Mesh mesh){
         if(photos.isEmpty()||mesh.triangles==0)return null;

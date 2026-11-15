@@ -19,7 +19,7 @@ import java.util.List;
  */
 final class SurfaceBuilder {
     static final int UNCOVERED = 0, PHOTO = 1, ESTIMATED = 2, MODEL = 3;
-    static final int NEUTRAL = 0xff90a5b6;
+    static final int NEUTRAL = 0xffc9c4bc;   // light warm grey for surface no photo saw
     static final int STRIDE = 2;
     static final float OWNER_CELL_M = 0.04f;
 
@@ -211,11 +211,14 @@ final class SurfaceBuilder {
                     if (f.pixelColor != null) cellColor[at] = f.pixelColor[pixel];
                 }
             }
+            // Whole-frame estimates (ARCore smoothed depth, AI) sit a few cm off the measured surface; they may
+            // only add triangles where no surface exists in the neighbouring 4 cm cells, so they never double it.
+            boolean gapOnly = f.allEstimated || f.modelMask != null;
             boolean used = false;
             for (int j = 0; j + 1 < gh; j++) for (int i = 0; i + 1 < gw; i++) {
                 int a = j * gw + i, b = a + 1, c = a + gw, d = c + 1;
-                used |= triangle(a, b, c, z, world, cellColor, cellSource, fi, owner, xyz, color, source, mesh);
-                used |= triangle(b, d, c, z, world, cellColor, cellSource, fi, owner, xyz, color, source, mesh);
+                used |= triangle(a, b, c, z, world, cellColor, cellSource, fi, owner, xyz, color, source, mesh, gapOnly);
+                used |= triangle(b, d, c, z, world, cellColor, cellSource, fi, owner, xyz, color, source, mesh, gapOnly);
                 if (mesh.triangles >= maxTriangles) break;
             }
             if (used) mesh.framesUsed++;
@@ -226,12 +229,19 @@ final class SurfaceBuilder {
 
     private static boolean triangle(int a, int b, int c, float[] z, float[] world, int[] cellColor, byte[] cellSource,
                                     int frame, HashMap<Long, Integer> owner, FloatList xyz, IntList color,
-                                    ByteList source, Mesh mesh) {
+                                    ByteList source, Mesh mesh, boolean gapOnly) {
         if (!connected(z[a], z[b], z[c])) return false;
         float cx = (world[3 * a] + world[3 * b] + world[3 * c]) / 3;
         float cy = (world[3 * a + 1] + world[3 * b + 1] + world[3 * c + 1]) / 3;
         float cz = (world[3 * a + 2] + world[3 * b + 2] + world[3 * c + 2]) / 3;
         long key = cellKey(cx) << 42 | cellKey(cy) << 21 | cellKey(cz);
+        if (gapOnly) {
+            long kx = (long) Math.floor(cx / OWNER_CELL_M), ky = (long) Math.floor(cy / OWNER_CELL_M), kz = (long) Math.floor(cz / OWNER_CELL_M);
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                Integer o = owner.get(((kx + dx) & 0x1fffffL) << 42 | ((ky + dy) & 0x1fffffL) << 21 | ((kz + dz) & 0x1fffffL));
+                if (o != null && o != frame) return false;
+            }
+        }
         Integer first = owner.putIfAbsent(key, frame);
         if (first != null && first != frame) return false;   // another frame already drew this patch
         int photo = 0, estimated = 0, model = 0;

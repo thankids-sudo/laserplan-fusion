@@ -46,4 +46,11 @@ with open(os.path.join(out, 'frames.txt'), 'w') as o:
         o.write(' '.join(map(str, [d['width'], d['height'], d['fx'], d['fy'], d['cx'], d['cy'],
             os.path.join(root, f['depth']['file']), os.path.join(root, conf['file']) if conf else '-',
             f['pixels'].get('accepted', 0)] + list(f['pose']['matrixColumnMajor']))) + '\n')
+with open(os.path.join(out, 'frames_smooth.txt'), 'w') as o:
+    for f in frames:
+        sd = f.get('smoothedDepth')
+        if not sd or 'pose' not in sd: continue
+        k = sd['intrinsics']
+        o.write(' '.join(map(str, [sd['width'], sd['height'], k['fx'], k['fy'], k['cx'], k['cy'],
+            os.path.join(root, sd['file']), '-', 0] + list(sd['pose']['matrixColumnMajor']))) + '\n')
 print('points', N, 'photo-coloured', int((cw > 0).sum()))
